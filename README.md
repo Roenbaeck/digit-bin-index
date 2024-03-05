@@ -1,2 +1,2 @@
-# hyperweight
-A hyperweight is a compact representation of a number of weights in the interval (0,1) structured for fast selection and removal of a particular weight based on the accumulated value of the contained weights.
+# Hyperweight
+A hyperweight is a compact representation of a number of weights in the interval (0,1) structured for fast selection and removal of a particular weight based on the accumulated values of the contained weights. The use case for which this was developed is to perform fast selections in a [Wallenius' noncentral hypergeometric distribution](https://en.wikipedia.org/wiki/Wallenius%27_noncentral_hypergeometric_distribution). Despite the daunting name, such probability distributions are very common and needs to be managed when simulations or forecasts are made. One example is [mortality models](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4060603/).
