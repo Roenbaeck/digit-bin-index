@@ -7,15 +7,15 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'hyperdecimal'",
+            "name": "Debug executable 'hyperweight'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=hyperdecimal",
-                    "--package=hyperdecimal"
+                    "--bin=hyperweight",
+                    "--package=hyperweight"
                 ],
                 "filter": {
-                    "name": "hyperdecimal",
+                    "name": "hyperweight",
                     "kind": "bin"
                 }
             },
@@ -25,16 +25,16 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in executable 'hyperdecimal'",
+            "name": "Debug unit tests in executable 'hyperweight'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
-                    "--bin=hyperdecimal",
-                    "--package=hyperdecimal"
+                    "--bin=hyperweight",
+                    "--package=hyperweight"
                 ],
                 "filter": {
-                    "name": "hyperdecimal",
+                    "name": "hyperweight",
                     "kind": "bin"
                 }
             },

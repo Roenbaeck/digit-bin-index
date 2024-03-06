@@ -36,7 +36,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyperdecimal"
+name = "hyperweight"
 version = "0.1.0"
 dependencies = [
  "fraction",
