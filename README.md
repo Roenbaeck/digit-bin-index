@@ -75,8 +75,8 @@ First, add `digit-bin-index` to your `Cargo.toml`:
 ```toml
 [dependencies]
 digit-bin-index = "0.1.0" # Replace with the actual version
-fraction = "0.14" # This structure relies on the Decimal type
-rand = "0.8"
+fraction = "0.15" # This structure relies on the Decimal type
+rand = "0.9"
 ```
 
 Then, you can use it in your project:
@@ -91,10 +91,10 @@ fn main() {
 
     // Add individuals with unique IDs and associated weights.
     // Note: 0.12345 will be binned as 0.123 due to the precision.
-    index.add(101, Decimal::new(543, 3));    // 0.543
-    index.add(102, Decimal::new(120, 3));    // 0.120
-    index.add(103, Decimal::new(543, 3));    // another 0.543
-    index.add(104, Decimal::new(12345, 5));  // 0.12345
+    index.add(101, Decimal::from(0.543));    // 0.543
+    index.add(102, Decimal::from(0.120));    // 0.120
+    index.add(103, Decimal::from(0.543));    // another 0.543
+    index.add(104, Decimal::from(0.12345));  // 0.12345
 
     println!(
         "Initial state: {} individuals, total weight = {}",
