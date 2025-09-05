@@ -176,11 +176,13 @@ impl DigitBinIndex {
     ) -> (u32, Decimal, Vec<usize>) {
         match &mut node.content {
             NodeContent::Leaf(individuals) => {
-                // --- FIX: Use the modern, fully-qualified call ---
-                let mut rng = rand::rng();
+        let mut rng = rand::rng();
                 let rand_index = rng.random_range(0..individuals.len());
                 let selected_id = individuals.swap_remove(rand_index);
-                let weight = node.accumulated_value / Decimal::from(node.content_count + 1);
+                // The average weight of an item in this bin is the total accumulated value
+                // divided by the number of items *before* removal.
+                let weight = node.accumulated_value / Decimal::from(node.content_count);
+
                 (selected_id, weight, path)
             }
             NodeContent::Internal(children) => {
@@ -196,7 +198,7 @@ impl DigitBinIndex {
             }
         }
     }
-
+    
     /// After an individual is removed, this updates counts up the tree.
     fn update_values_post_removal(&mut self, path: &[usize], weight: Decimal) {
         let mut current_node = &mut self.root;
@@ -221,5 +223,76 @@ impl DigitBinIndex {
     /// Returns the sum of all probabilities in the index.
     pub fn total_weight(&self) -> Decimal {
         self.root.accumulated_value
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fraction::{Decimal};
+
+    #[test]
+    fn test_selection_distribution_is_biased_correctly() {
+        // --- Setup: Create a controlled population ---
+        const ITEMS_PER_GROUP: u32 = 1000;
+        const TOTAL_ITEMS: u32 = ITEMS_PER_GROUP * 2;
+        const NUM_DRAWS: u32 = TOTAL_ITEMS / 2;
+
+        let low_risk_weight = Decimal::from(0.1); // 0.1
+        let high_risk_weight = Decimal::from(0.2); // 0.2
+
+        // --- Execution: Run many simulations to average out randomness ---
+        const NUM_SIMULATIONS: u32 = 100;
+        let mut total_high_risk_selected = 0;
+
+        for _ in 0..NUM_SIMULATIONS {
+            let mut index = DigitBinIndex::with_precision(3);
+            for i in 0..ITEMS_PER_GROUP { index.add(i, low_risk_weight); }
+            for i in ITEMS_PER_GROUP..TOTAL_ITEMS { index.add(i, high_risk_weight); }
+
+            let mut high_risk_in_this_run = 0;
+            for _ in 0..NUM_DRAWS {
+                if let Some((selected_id, _)) = index.select_and_remove() {
+                    if selected_id >= ITEMS_PER_GROUP {
+                        high_risk_in_this_run += 1;
+                    }
+                }
+            }
+            total_high_risk_selected += high_risk_in_this_run;
+        }
+
+        // --- Validation: Check the statistical properties of a Wallenius' draw ---
+        let avg_high_risk = total_high_risk_selected as f64 / NUM_SIMULATIONS as f64;
+
+        // 1. The mean of a uniform draw (central hypergeometric) would be 500.
+        let uniform_mean = NUM_DRAWS as f64 * 0.5;
+
+        // 2. The mean of a simultaneous draw (Fisher's NCG) is based on initial proportions.
+        // This is the naive expectation we started with.
+        let fishers_mean = NUM_DRAWS as f64 * (2.0 / 3.0); // ~666.67
+
+        // The mean of a Wallenius' draw is mathematically proven to lie strictly
+        // between the uniform mean and the Fisher's mean.
+        assert!(
+            avg_high_risk > uniform_mean,
+            "Test failed: Result {:.2} was not biased towards higher weights (uniform mean is {:.2})",
+            avg_high_risk, uniform_mean
+        );
+
+        assert!(
+            avg_high_risk < fishers_mean,
+            "Test failed: Result {:.2} showed too much bias. It should be less than the Fisher's mean of {:.2} due to the Wallenius effect.",
+            avg_high_risk, fishers_mean
+        );
+
+        println!(
+            "Distribution test passed: Got an average of {:.2} high-risk selections.",
+            avg_high_risk
+        );
+        println!(
+            "This correctly lies between the uniform mean ({:.2}) and the Fisher's mean ({:.2}), confirming the Wallenius' distribution behavior.",
+            uniform_mean, fishers_mean
+        );
     }
 }
