@@ -1,2 +1,108 @@
-# Hyperweight
-A hyperweight is a compact representation of a number of weights in the interval (0,1) structured for fast selection and removal of a particular weight based on the accumulated values of the contained weights. The use case for which this was developed is to perform fast selections in a [Wallenius' noncentral hypergeometric distribution](https://en.wikipedia.org/wiki/Wallenius%27_noncentral_hypergeometric_distribution). Despite the daunting name, such probability distributions are very common and needs to be managed when simulations or forecasts are made. One example is [mortality models](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4060603/).
+# DigitBinIndex
+
+A `DigitBinIndex` is a tree-based data structure that organizes a large collection of weighted items to enable highly efficient weighted random selection and removal. It is a specialized tool, purpose-built for scenarios with millions of items where probabilities are approximate and high performance is critical.
+
+### The Core Problem
+
+In many simulations, forecasts, or statistical models, one needs to manage a large, dynamic set of probabilities. A common task is to randomly select an item based on its weight (probability), remove it from the set, and repeat this process thousands of times. Doing this efficiently with millions of items is a non-trivial performance challenge.
+
+The use case for which this was originally developed is to perform fast selections in a [Wallenius' noncentral hypergeometric distribution](https://en.wikipedia.org/wiki/Wallenius%27_noncentral_hypergeometric_distribution). This sequential sampling model is common in complex agent-based simulations, such as [mortality models](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4060603/).
+
+### How It Works
+
+`DigitBinIndex` is a radix tree where the path is determined by the decimal digits of the probabilities. This structure allows it to group items into "bins" based on a configurable level of precision.
+
+1.  **Digit-based Tree Structure**: The index builds a tree where each level corresponds to a decimal place. For a probability like `0.543`, an item would be placed by traversing the path: `root -> child[5] -> child[4] -> child[3]`.
+
+2.  **Binning**: The node at the end of a path acts as a "bin," holding a list of all individuals whose probabilities are truncated to that value. For example, with a precision of 3, probabilities `0.543`, `0.5432`, and `0.5439` would all be placed in the `0.543` bin.
+
+3.  **Accumulated Value Index**: Each node in the tree stores the `accumulated_value` (the sum of all probabilities beneath it). This is the key to its speed. To select an item, a random number is generated between 0 and the root's total value. The tree is then traversed, "spending" the random number on the accumulated values of the branches until a leaf bin is selected.
+
+### Features
+
+*   **Fast Selection**: Weighted random selection is an **O(P)** operation, where P is the configured precision. This is effectively constant time, independent of the number of items.
+*   **Fast Updates**: Adding and removing items are also **O(P)** operations.
+*   **Configurable Precision**: The desired precision can be set during instantiation, allowing you to balance accuracy with performance and memory.
+*   **Memory Efficient**: For datasets where many items share the same effective probability (up to the chosen precision), this structure is highly memory efficient.
+
+---
+
+### Choosing the Right Tool: DigitBinIndex vs. General-Purpose Structures
+
+`DigitBinIndex` is a specialized data structure. Its design makes a deliberate engineering trade-off: it sacrifices a small, controllable amount of precision to gain significant improvements in speed and memory usage for its target use case.
+
+The standard, general-purpose tool for this type of problem is a **Fenwick Tree** (or Binary Indexed Tree), which can store the exact probability for every individual. Here is how they compare:
+
+| Feature | `DigitBinIndex` (This Crate) | Fenwick Tree (General-Purpose) |
+| :--- | :--- | :--- |
+| **Time Complexity** | **O(P)** <br>*(P = configured precision)* | **O(log N)** <br>*(N = number of individuals)* |
+| **Accuracy** | **Binned (Approximate)** <br>Quantizes probabilities to `P` decimal places. | **Perfect (Exact)** <br>Stores the precise probability for every item. |
+| **Memory Usage** | **Low for binned data** <br>Excels when many items share a probability prefix. | **High** <br>Requires an array of size `N`. |
+| **Ideal Data**| Empirical probabilities (from medicine, ML, etc.) where precision beyond a few digits is noise. | Theoretical probabilities (from physics, crypto, etc.) where high precision is meaningful. |
+| **Statistical Model**| Purpose-built for **Wallenius' distribution** (sequential sampling). | General-purpose; can be used for Wallenius and as a component for other models. |
+
+#### ✅ When to Choose DigitBinIndex
+
+This structure is the preferred choice when your scenario matches these conditions:
+*   **You have a very large number of items (`N` is in the millions).**
+*   **Performance is critical.** For a large `N` and a moderate `P` (e.g., `P=5`), O(P) is significantly faster than O(log N).
+*   **Your probabilities are approximate.** If your weights come from empirical data, simulations, or machine learning models, the precision beyond a few decimal places is often meaningless. Binning these values is a sensible and efficient compromise.
+*   **Many items share the same effective probability.** This is where the memory savings are most significant.
+
+#### ❌ When to Consider an Alternative (like a Fenwick Tree)
+
+You should use a more general-purpose data structure if:
+*   **You require perfect, lossless precision.** If all your items have unique probabilities that only differ at a high decimal place (e.g., the 15th digit), you would need to set `P` so high that the performance and memory benefits of `DigitBinIndex` would be completely lost.
+
+---
+
+### Usage
+
+First, add `digit-bin-index` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+digit-bin-index = "0.1.0" # Replace with the actual version
+fraction = "0.14" # This structure relies on the Decimal type
+rand = "0.8"
+```
+
+Then, you can use it in your project:
+
+```rust
+use digit_bin_index::DigitBinIndex;
+use fraction::Decimal;
+
+fn main() {
+    // Create an index with a precision of 3 decimal places.
+    let mut index = DigitBinIndex::with_precision(3);
+
+    // Add individuals with unique IDs and associated weights.
+    // Note: 0.12345 will be binned as 0.123 due to the precision.
+    index.add(101, Decimal::from_parts(543, 0, 3, false));    // 0.543
+    index.add(102, Decimal::from_parts(120, 0, 3, false));    // 0.120
+    index.add(103, Decimal::from_parts(543, 0, 3, false));    // another 0.543
+    index.add(104, Decimal::from_parts(12345, 0, 5, false));  // 0.123
+
+    println!(
+        "Initial state: {} individuals, total weight = {}",
+        index.count(),
+        index.total_weight()
+    );
+
+    // select_and_remove() performs a weighted random selection and removes the item.
+    if let Some((selected_id, original_weight)) = index.select_and_remove() {
+        println!("\nSelected individual {} (weight ~{})", selected_id, original_weight);
+    }
+
+    println!(
+        "Final state: {} individuals, total weight = {}",
+        index.count(),
+        index.total_weight()
+    );
+}
+```
+
+### License
+
+This project is licensed under the [MIT License](LICENSE).
