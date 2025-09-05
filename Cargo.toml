@@ -7,11 +7,11 @@ description = "A high-performance data structure for weighted random sampling of
 repository = "https://github.com/Roenbaeck/digit-bin-index" 
 
 [dependencies]
-fraction = "0.15.1"
-rand = "0.8.5"
+fraction = "0.15"
+rand = "0.9"
 
 [dev-dependencies]
-criterion = { version = "0.4", features = ["html_reports"] }
+criterion = { version = "0.7", features = ["html_reports"] }
 
 [[bench]]
 name = "selection_benchmark"

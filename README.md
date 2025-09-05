@@ -31,28 +31,40 @@ The use case for which this was originally developed is to perform fast selectio
 
 `DigitBinIndex` is a specialized data structure. Its design makes a deliberate engineering trade-off: it sacrifices a small, controllable amount of precision to gain significant improvements in speed and memory usage for its target use case.
 
-The standard, general-purpose tool for this type of problem is a **Fenwick Tree** (or Binary Indexed Tree), which can store the exact probability for every individual. Here is how they compare:
+The standard, general-purpose tool for this type of problem is a **Fenwick Tree** (or Binary Indexed Tree), which can store the exact probability for every individual. Here is how they compare conceptually:
 
 | Feature | `DigitBinIndex` (This Crate) | Fenwick Tree (General-Purpose) |
 | :--- | :--- | :--- |
 | **Time Complexity** | **O(P)** <br>*(P = configured precision)* | **O(log N)** <br>*(N = number of individuals)* |
 | **Accuracy** | **Binned (Approximate)** <br>Quantizes probabilities to `P` decimal places. | **Perfect (Exact)** <br>Stores the precise probability for every item. |
-| **Memory Usage** | **Low for binned data** <br>Excels when many items share a probability prefix. | **High** <br>Requires an array of size `N`. |
 | **Ideal Data**| Empirical probabilities (from medicine, ML, etc.) where precision beyond a few digits is noise. | Theoretical probabilities (from physics, crypto, etc.) where high precision is meaningful. |
-| **Statistical Model**| Purpose-built for **Wallenius' distribution** (sequential sampling). | General-purpose; can be used for Wallenius and as a component for other models. |
+
+This difference in time complexity leads to a dramatic performance gap in practice, as shown by the benchmark results below.
+
+### Performance
+
+The following benchmarks compare the time for a single `select_and_remove` operation for both data structures across a growing number of individuals (`N`).
+
+| Number of Items (N) | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
+| :------------------ | :------------------- | :----------------- | :----------------- |
+| 100,000             | **~10.3 µs**         | ~5,579 µs (5.58 ms)  | **~542x faster**   |
+| 1,000,000           | **~346.1 µs**        | ~59,041 µs (59.0 ms) | **~171x faster**   |
+| 10,000,000          | **~739.1 µs**        | ~624,050 µs (624 ms) | **~844x faster**   |
+
+As the table shows, `DigitBinIndex` is not just faster; it is **orders of magnitude faster** for its intended use case.
 
 #### ✅ When to Choose DigitBinIndex
 
 This structure is the preferred choice when your scenario matches these conditions:
 *   **You have a very large number of items (`N` is in the millions).**
-*   **Performance is critical.** For a large `N` and a moderate `P` (e.g., `P=5`), O(P) is significantly faster than O(log N).
-*   **Your probabilities are approximate.** If your weights come from empirical data, simulations, or machine learning models, the precision beyond a few decimal places is often meaningless. Binning these values is a sensible and efficient compromise.
-*   **Many items share the same effective probability.** This is where the memory savings are most significant.
+*   **Performance is critical.**
+*   **Your probabilities are approximate.** If your weights come from empirical data, simulations, or machine learning models, the precision beyond a few decimal places is often meaningless.
+*   **Many items share the same effective probability.**
 
 #### ❌ When to Consider an Alternative (like a Fenwick Tree)
 
 You should use a more general-purpose data structure if:
-*   **You require perfect, lossless precision.** If all your items have unique probabilities that only differ at a high decimal place (e.g., the 15th digit), you would need to set `P` so high that the performance and memory benefits of `DigitBinIndex` would be completely lost.
+*   **You require perfect, lossless precision.** If all your items have unique probabilities that only differ at a high decimal place (e.g., the 15th digit), you would need to set `P` so high that the performance and memory benefits would be lost.
 
 ---
 
@@ -79,10 +91,10 @@ fn main() {
 
     // Add individuals with unique IDs and associated weights.
     // Note: 0.12345 will be binned as 0.123 due to the precision.
-    index.add(101, Decimal::from_parts(543, 0, 3, false));    // 0.543
-    index.add(102, Decimal::from_parts(120, 0, 3, false));    // 0.120
-    index.add(103, Decimal::from_parts(543, 0, 3, false));    // another 0.543
-    index.add(104, Decimal::from_parts(12345, 0, 5, false));  // 0.123
+    index.add(101, Decimal::new(543, 3));    // 0.543
+    index.add(102, Decimal::new(120, 3));    // 0.120
+    index.add(103, Decimal::new(543, 3));    // another 0.543
+    index.add(104, Decimal::new(12345, 5));  // 0.12345
 
     println!(
         "Initial state: {} individuals, total weight = {}",

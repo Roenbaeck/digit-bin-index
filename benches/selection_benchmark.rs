@@ -1,9 +1,9 @@
 use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+    criterion_group, criterion_main, BenchmarkId, Criterion, PlotConfiguration, Throughput, AxisScale
 };
 use digit_bin_index::DigitBinIndex;
-use fraction::Decimal;
-use rand::prelude::*;
+use fraction::{Decimal, Zero}; 
+use rand::Rng; 
 
 // --- Competitor Implementation: Fenwick Tree (Binary Indexed Tree) ---
 // This is the standard, general-purpose data structure for this problem.
@@ -57,8 +57,8 @@ impl FenwickTree {
             return None;
         }
 
-        let mut rng = thread_rng();
-        let random_target = rng.gen_range(Decimal::from(0)..total_weight);
+        let mut rng = rand::rng();
+        let random_target = Decimal::from(rng.random_range(0.0..total_weight.try_into().unwrap()));
 
         let index = self.find(random_target);
         
@@ -77,16 +77,20 @@ impl FenwickTree {
 fn benchmark_select_and_remove(c: &mut Criterion) {
     let mut group = c.benchmark_group("Select and Remove Performance");
 
+    let plot_config = PlotConfiguration::default()
+        .summary_scale(AxisScale::Linear); // Can be set to Logarithmic
+    group.plot_config(plot_config);
+
     // We will test for different numbers of individuals (N)
     for &n in &[10_000, 100_000, 1_000_000] {
         group.throughput(Throughput::Elements(1)); // We measure time per single operation
 
         // --- Setup ---
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = rand::rng();
         let precision_val = 5;
         let denominator = Decimal::from(u64::pow(10, precision_val));
         let weights: Vec<Decimal> = (0..n)
-            .map(|_| Decimal::from(rng.gen_range(1..=100_000)) / denominator)
+            .map(|_| Decimal::from(rng.random_range(1..=100_000)) / denominator)
             .collect();
         
         // --- DigitBinIndex Benchmark ---

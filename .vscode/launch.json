@@ -1,22 +1,19 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'hyperweight'",
+            "name": "Debug example 'simulation'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=hyperweight",
-                    "--package=hyperweight"
+                    "--example=simulation",
+                    "--package=digit_bin_index"
                 ],
                 "filter": {
-                    "name": "hyperweight",
-                    "kind": "bin"
+                    "name": "simulation",
+                    "kind": "example"
                 }
             },
             "args": [],
@@ -25,17 +22,17 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in executable 'hyperweight'",
+            "name": "Debug unit tests in library 'digit-bin-index'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
-                    "--bin=hyperweight",
-                    "--package=hyperweight"
+                    "--lib",
+                    "--package=digit_bin_index"
                 ],
                 "filter": {
-                    "name": "hyperweight",
-                    "kind": "bin"
+                    "name": "digit-bin-index",
+                    "kind": "lib"
                 }
             },
             "args": [],

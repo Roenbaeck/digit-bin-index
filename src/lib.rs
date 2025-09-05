@@ -7,8 +7,8 @@
 //! particularly for simulations involving sequential sampling like Wallenius'
 //! noncentral hypergeometric distribution.
 
-use fraction::Decimal;
-use rand::{thread_rng, Rng};
+use fraction::{Decimal, Zero}; 
+use rand::Rng; 
 use std::vec;
 
 // The default precision to use if none is specified in the constructor.
@@ -61,6 +61,12 @@ pub struct DigitBinIndex {
     pub root: Node,
     /// The precision (number of decimal places) used for binning.
     pub precision: u8,
+}
+
+impl Default for DigitBinIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DigitBinIndex {
@@ -152,8 +158,11 @@ impl DigitBinIndex {
         if self.root.content_count == 0 {
             return None;
         }
-        let mut rng = thread_rng();
-        let random_target = rng.gen_range(Decimal::from(0)..self.root.accumulated_value);
+        
+        // --- FIX: Use the modern, fully-qualified call ---
+        let mut rng = rand::rng();
+        let random_target = Decimal::from(rng.random_range(0.0..self.root.accumulated_value.try_into().unwrap()));
+        
         let (selected_id, weight, path) = Self::select_recurse(&mut self.root, random_target, vec![]);
         self.update_values_post_removal(&path, weight);
         Some((selected_id, weight))
@@ -167,8 +176,9 @@ impl DigitBinIndex {
     ) -> (u32, Decimal, Vec<usize>) {
         match &mut node.content {
             NodeContent::Leaf(individuals) => {
-                let mut rng = thread_rng();
-                let rand_index = rng.gen_range(0..individuals.len());
+                // --- FIX: Use the modern, fully-qualified call ---
+                let mut rng = rand::rng();
+                let rand_index = rng.random_range(0..individuals.len());
                 let selected_id = individuals.swap_remove(rand_index);
                 let weight = node.accumulated_value / Decimal::from(node.content_count + 1);
                 (selected_id, weight, path)
