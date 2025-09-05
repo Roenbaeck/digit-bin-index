@@ -1,12 +1,12 @@
 # DigitBinIndex
 
-A `DigitBinIndex` is a tree-based data structure that organizes a large collection of weighted items to enable highly efficient weighted random selection and removal. It is particularly effective for scenarios with millions of items where many may share the same probability.
+A `DigitBinIndex` is a tree-based data structure that organizes a large collection of weighted items to enable highly efficient weighted random selection and removal. It is a specialized tool, purpose-built for scenarios with millions of items where probabilities are approximate and high performance is critical.
 
 ### The Core Problem
 
 In many simulations, forecasts, or statistical models, one needs to manage a large, dynamic set of probabilities. A common task is to randomly select an item based on its weight (probability), remove it from the set, and repeat this process thousands of times. Doing this efficiently with millions of items is a non-trivial performance challenge.
 
-The use case for which this was originally developed is to perform fast selections in a [Wallenius' noncentral hypergeometric distribution](https://en.wikipedia.org/wiki/Wallenius%27_noncentral_hypergeometric_distribution). Despite the daunting name, such probability distributions are very common. One example is in complex agent-based [mortality models](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4060603/), where each individual has a unique probability of an event occurring in a given time step.
+The use case for which this was originally developed is to perform fast selections in a [Wallenius' noncentral hypergeometric distribution](https://en.wikipedia.org/wiki/Wallenius%27_noncentral_hypergeometric_distribution). This sequential sampling model is common in complex agent-based simulations, such as [mortality models](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4060603/).
 
 ### How It Works
 
@@ -18,14 +18,43 @@ The use case for which this was originally developed is to perform fast selectio
 
 3.  **Accumulated Value Index**: Each node in the tree stores the `accumulated_value` (the sum of all probabilities beneath it). This is the key to its speed. To select an item, a random number is generated between 0 and the root's total value. The tree is then traversed, "spending" the random number on the accumulated values of the branches until a leaf bin is selected.
 
-This approach makes both selection and removal operations extremely fast, typically dependent only on the chosen precision, not the number of items.
-
 ### Features
 
-*   **Fast Selection**: Weighted random selection is an O(P) operation, where P is the configured precision. This is effectively constant time, independent of the number of items.
-*   **Fast Updates**: Adding and removing items are also O(P) operations.
+*   **Fast Selection**: Weighted random selection is an **O(P)** operation, where P is the configured precision. This is effectively constant time, independent of the number of items.
+*   **Fast Updates**: Adding and removing items are also **O(P)** operations.
 *   **Configurable Precision**: The desired precision can be set during instantiation, allowing you to balance accuracy with performance and memory.
-*   **Memory Efficient**: For datasets where many items share the same effective probability (up to the chosen precision), this structure is highly memory efficient, as it only stores the list of individuals in the final bin, not in the tree itself.
+*   **Memory Efficient**: For datasets where many items share the same effective probability (up to the chosen precision), this structure is highly memory efficient.
+
+---
+
+### Choosing the Right Tool: DigitBinIndex vs. General-Purpose Structures
+
+`DigitBinIndex` is a specialized data structure. Its design makes a deliberate engineering trade-off: it sacrifices a small, controllable amount of precision to gain significant improvements in speed and memory usage for its target use case.
+
+The standard, general-purpose tool for this type of problem is a **Fenwick Tree** (or Binary Indexed Tree), which can store the exact probability for every individual. Here is how they compare:
+
+| Feature | `DigitBinIndex` (This Crate) | Fenwick Tree (General-Purpose) |
+| :--- | :--- | :--- |
+| **Time Complexity** | **O(P)** <br>*(P = configured precision)* | **O(log N)** <br>*(N = number of individuals)* |
+| **Accuracy** | **Binned (Approximate)** <br>Quantizes probabilities to `P` decimal places. | **Perfect (Exact)** <br>Stores the precise probability for every item. |
+| **Memory Usage** | **Low for binned data** <br>Excels when many items share a probability prefix. | **High** <br>Requires an array of size `N`. |
+| **Ideal Data**| Empirical probabilities (from medicine, ML, etc.) where precision beyond a few digits is noise. | Theoretical probabilities (from physics, crypto, etc.) where high precision is meaningful. |
+| **Statistical Model**| Purpose-built for **Wallenius' distribution** (sequential sampling). | General-purpose; can be used for Wallenius and as a component for other models. |
+
+#### ✅ When to Choose DigitBinIndex
+
+This structure is the preferred choice when your scenario matches these conditions:
+*   **You have a very large number of items (`N` is in the millions).**
+*   **Performance is critical.** For a large `N` and a moderate `P` (e.g., `P=5`), O(P) is significantly faster than O(log N).
+*   **Your probabilities are approximate.** If your weights come from empirical data, simulations, or machine learning models, the precision beyond a few decimal places is often meaningless. Binning these values is a sensible and efficient compromise.
+*   **Many items share the same effective probability.** This is where the memory savings are most significant.
+
+#### ❌ When to Consider an Alternative (like a Fenwick Tree)
+
+You should use a more general-purpose data structure if:
+*   **You require perfect, lossless precision.** If all your items have unique probabilities that only differ at a high decimal place (e.g., the 15th digit), you would need to set `P` so high that the performance and memory benefits of `DigitBinIndex` would be completely lost.
+
+---
 
 ### Usage
 
