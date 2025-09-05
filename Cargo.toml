@@ -1,8 +1,19 @@
 [package]
-name = "hyperweight"
+name = "digit_bin_index"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "A high-performance data structure for weighted random sampling of binned probabilities."
+repository = "https://github.com/your-username/digit-bin-index" # Replace with your repo URL
 
 [dependencies]
 fraction = "0.15.1"
 rand = "0.8.5"
+
+[dev-dependencies]
+criterion = { version = "0.4", features = ["html_reports"] }
+
+[[bench]]
+name = "selection_benchmark"
+harness = false
+
