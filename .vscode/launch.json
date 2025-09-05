@@ -9,7 +9,7 @@
                 "args": [
                     "build",
                     "--example=simulation",
-                    "--package=digit_bin_index"
+                    "--package=digit-bin-index"
                 ],
                 "filter": {
                     "name": "simulation",
@@ -28,7 +28,7 @@
                     "test",
                     "--no-run",
                     "--lib",
-                    "--package=digit_bin_index"
+                    "--package=digit-bin-index"
                 ],
                 "filter": {
                     "name": "digit-bin-index",

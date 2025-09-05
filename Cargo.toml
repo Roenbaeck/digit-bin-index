@@ -1,10 +1,14 @@
 [package]
-name = "digit_bin_index"
-version = "0.1.0"
+name = "digit-bin-index"
+version = "0.1.0" 
 edition = "2021"
-license = "MIT"
-description = "A high-performance data structure for weighted random sampling of binned probabilities."
+authors = ["Lars Rönnbäck <lars@uptochange.com>"] 
+license = "MIT" 
+description = "A high-performance, O(P) data structure for weighted random sampling of binned probabilities, ideal for large-scale simulations." 
 repository = "https://github.com/Roenbaeck/digit-bin-index" 
+readme = "README.md" 
+keywords = ["statistics", "probability", "weighted-sampling", "simulation", "data-structure"] 
+categories = ["data-structures", "algorithms", "science", "simulation"] 
 
 [dependencies]
 fraction = "0.15"
