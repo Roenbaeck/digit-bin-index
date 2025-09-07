@@ -9,6 +9,7 @@
 
 use fraction::{Decimal, Zero}; 
 use rand::Rng; 
+use std::collections::HashSet; 
 use std::vec;
 
 // The default precision to use if none is specified in the constructor.
@@ -168,6 +169,100 @@ impl DigitBinIndex {
         Some((selected_id, weight))
     }
 
+    /// Performs a simultaneous weighted random selection of `k` unique items (Fisher's model).
+    ///
+    /// This uses an optimized "bin-aware rejection sampling" algorithm that is significantly
+    /// faster than naive rejection sampling. The process is:
+    /// 1. A selection phase where `k` unique individuals are chosen from the unaltered index.
+    /// 2. An update phase where all chosen individuals are removed from the index.
+    ///
+    /// Returns `None` if `num_to_draw` is greater than the total number of items.
+    pub fn select_many_and_remove(&mut self, num_to_draw: u32) -> Option<HashSet<u32>> {
+        if num_to_draw > self.count() { return None; }
+        if num_to_draw == 0 { return Some(HashSet::new()); }
+
+        let mut selected_ids = HashSet::with_capacity(num_to_draw as usize);
+        let mut selections = Vec::with_capacity(num_to_draw as usize);
+
+        while selected_ids.len() < num_to_draw as usize {
+            if let Some((id, weight, path)) = self.weighted_find_unique(&selected_ids) {
+                if selected_ids.insert(id) {
+                    selections.push((path, id, weight));
+                }
+            }
+        }
+
+        for (path, id, weight) in selections {
+            // --- FIX: Call the static helper method ---
+            Self::update_and_remove_recurse(&mut self.root, &path, id, weight);
+        }
+
+        Some(selected_ids)
+    }
+
+    /// Recursive helper to correctly update the tree and remove an item from a leaf.
+    fn update_and_remove_recurse(node: &mut Node, path: &[usize], id_to_remove: u32, weight: Decimal) {
+        node.content_count -= 1;
+        node.accumulated_value -= weight;
+        
+        let Some(&index) = path.first() else {
+            // If the path is empty, we are at the target node.
+            if let NodeContent::Leaf(individuals) = &mut node.content {
+                individuals.retain(|&x| x != id_to_remove);
+            }
+            return;
+        };
+
+        if let NodeContent::Internal(children) = &mut node.content {
+            if let Some(child) = children.get_mut(index) {
+                // The recursive call is now to the static method itself.
+                Self::update_and_remove_recurse(child, &path[1..], id_to_remove, weight);
+            }
+        }
+    }
+
+    /// Private helper to find a unique candidate using bin-aware rejection sampling.
+    fn weighted_find_unique(&self, selected_ids: &HashSet<u32>) -> Option<(u32, Decimal, Vec<usize>)> {
+        if self.root.content_count == 0 { return None; }
+        let mut rng = rand::rng();
+        let random_target = Decimal::from(rng.random_range(0.0..self.root.accumulated_value.try_into().unwrap()));
+        self.select_unique_recurse(&self.root, random_target, vec![], selected_ids)
+    }
+
+    /// Recursive part of the unique find operation.
+    fn select_unique_recurse(
+        &self,
+        node: &Node,
+        mut target: Decimal,
+        mut path: Vec<usize>,
+        selected_ids: &HashSet<u32>,
+    ) -> Option<(u32, Decimal, Vec<usize>)> {
+        match &node.content {
+            NodeContent::Leaf(individuals) => {
+                // The optimization: search the bin for any unselected individual.
+                for &id in individuals {
+                    if !selected_ids.contains(&id) {
+                        let weight = node.accumulated_value / Decimal::from(node.content_count);
+                        return Some((id, weight, path));
+                    }
+                }
+                // If all individuals in this bin are already selected, the bin is exhausted.
+                None
+            }
+            NodeContent::Internal(children) => {
+                for (i, child) in children.iter().enumerate() {
+                    if child.accumulated_value.is_zero() { continue; }
+                    if target < child.accumulated_value {
+                        path.push(i);
+                        return self.select_unique_recurse(child, target, path, selected_ids);
+                    }
+                    target -= child.accumulated_value;
+                }
+                panic!("Selection logic failed: target exceeded total value of children.");
+            }
+        }
+    }
+
     /// Recursive helper to find the individual and record the traversal path.
     fn select_recurse(
         node: &mut Node,
@@ -233,7 +328,7 @@ mod tests {
     use fraction::{Decimal};
 
     #[test]
-    fn test_selection_distribution_is_biased_correctly() {
+    fn test_wallenius_distribution_is_correct() {
         // --- Setup: Create a controlled population ---
         const ITEMS_PER_GROUP: u32 = 1000;
         const TOTAL_ITEMS: u32 = ITEMS_PER_GROUP * 2;
@@ -293,6 +388,44 @@ mod tests {
         println!(
             "This correctly lies between the uniform mean ({:.2}) and the Fisher's mean ({:.2}), confirming the Wallenius' distribution behavior.",
             uniform_mean, fishers_mean
+        );
+    }
+    #[test]
+    fn test_fisher_distribution_is_correct() {
+        const ITEMS_PER_GROUP: u32 = 1000;
+        const TOTAL_ITEMS: u32 = ITEMS_PER_GROUP * 2;
+        const NUM_DRAWS: u32 = TOTAL_ITEMS / 2;
+        let low_risk_weight = Decimal::from(0.1);
+        let high_risk_weight = Decimal::from(0.2);
+        const NUM_SIMULATIONS: u32 = 100;
+        let mut total_high_risk_selected = 0;
+
+        for _ in 0..NUM_SIMULATIONS {
+            let mut index = DigitBinIndex::with_precision(3);
+            for i in 0..ITEMS_PER_GROUP { index.add(i, low_risk_weight); }
+            for i in ITEMS_PER_GROUP..TOTAL_ITEMS { index.add(i, high_risk_weight); }
+            
+            // Call the new method
+            if let Some(selected_ids) = index.select_many_and_remove(NUM_DRAWS) {
+                let high_risk_in_this_run = selected_ids.iter().filter(|&&id| id >= ITEMS_PER_GROUP).count();
+                total_high_risk_selected += high_risk_in_this_run as u32;
+            }
+        }
+        
+        let avg_high_risk = total_high_risk_selected as f64 / NUM_SIMULATIONS as f64;
+        let fishers_mean = NUM_DRAWS as f64 * (2.0 / 3.0);
+        let tolerance = fishers_mean * 0.10;
+
+        // The mean of a Fisher's draw should be very close to the naive expectation.
+        assert!(
+            (avg_high_risk - fishers_mean).abs() < tolerance,
+            "Fisher's test failed: Result {:.2} was not close to the expected mean of {:.2}",
+            avg_high_risk, fishers_mean
+        );
+        
+        println!(
+            "Fisher's test passed: Got avg {:.2} high-risk selections (expected ~{:.2}).",
+            avg_high_risk, fishers_mean
         );
     }
 }
