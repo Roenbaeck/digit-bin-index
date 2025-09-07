@@ -74,7 +74,8 @@ First, add `digit-bin-index` to your `Cargo.toml`:
 digit-bin-index = "0.2.0" # Use the latest version
 fraction = "0.14"
 rand = "0.8"
-roaring = "0.10"```
+roaring = "0.10"
+```
 
 Then, you can use it in your project:
 
