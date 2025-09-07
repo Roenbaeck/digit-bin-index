@@ -2,11 +2,13 @@
 
 A `DigitBinIndex` is a tree-based data structure that organizes a large collection of weighted items to enable highly efficient weighted random selection and removal. It is a specialized tool, purpose-built for scenarios with millions of items where probabilities are approximate and high performance is critical.
 
+This library provides state-of-the-art, high-performance solutions for both major types of noncentral hypergeometric distributions:
+*   **Sequential Sampling (Wallenius'):** Modeled by `select_and_remove`.
+*   **Simultaneous Sampling (Fisher's):** Modeled by `select_many_and_remove`.
+
 ### The Core Problem
 
-In many simulations, forecasts, or statistical models, one needs to manage a large, dynamic set of probabilities. A common task is to randomly select an item based on its weight (probability), remove it from the set, and repeat this process thousands of times. Doing this efficiently with millions of items is a non-trivial performance challenge.
-
-The use case for which this was originally developed is to perform fast selections in a [Wallenius' noncentral hypergeometric distribution](https://en.wikipedia.org/wiki/Wallenius%27_noncentral_hypergeometric_distribution). This sequential sampling model is common in complex agent-based simulations, such as [mortality models](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4060603/).
+In many simulations, forecasts, or statistical models, one needs to manage a large, dynamic set of probabilities. A common task is to randomly select items based on their weight, remove them, and repeat. Doing this efficiently with millions of items is a non-trivial performance challenge, especially when modeling complex behaviors like [Wallenius'](https://en.wikipedia.org/wiki/Wallenius%27_noncentral_hypergeometric_distribution) or [Fisher's](https://en.wikipedia.org/wiki/Fisher%27s_noncentral_hypergeometric_distribution) distributions, which are common in agent-based simulations like [mortality models](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4060603/).
 
 ### How It Works
 
@@ -14,59 +16,54 @@ The use case for which this was originally developed is to perform fast selectio
 
 1.  **Digit-based Tree Structure**: The index builds a tree where each level corresponds to a decimal place. For a probability like `0.543`, an item would be placed by traversing the path: `root -> child[5] -> child[4] -> child[3]`.
 
-2.  **Binning**: The node at the end of a path acts as a "bin," holding a list of all individuals whose probabilities are truncated to that value. For example, with a precision of 3, probabilities `0.543`, `0.5432`, and `0.5439` would all be placed in the `0.543` bin.
+2.  **Roaring Bitmap Bins**: The node at the end of a path acts as a "bin." Instead of a simple list, it holds a [**Roaring Bitmap**](https://roaringbitmap.org/), a highly optimized data structure for storing and performing set operations on integers. This is the key to the library's high performance for simultaneous (Fisher's) draws.
 
-3.  **Accumulated Value Index**: Each node in the tree stores the `accumulated_value` (the sum of all probabilities beneath it). This is the key to its speed. To select an item, a random number is generated between 0 and the root's total value. The tree is then traversed, "spending" the random number on the accumulated values of the branches until a leaf bin is selected.
+3.  **Accumulated Value Index**: Each node in the tree stores the `accumulated_value` (the sum of all probabilities beneath it). This allows for extremely fast `O(P)` weighted random selection, where `P` is the configured precision.
 
 ### Features
 
-*   **Fast Selection**: Weighted random selection is an **O(P)** operation, where P is the configured precision. This is effectively constant time, independent of the number of items.
-*   **Fast Updates**: Adding and removing items are also **O(P)** operations.
-*   **Configurable Precision**: The desired precision can be set during instantiation, allowing you to balance accuracy with performance and memory.
-*   **Memory Efficient**: For datasets where many items share the same effective probability (up to the chosen precision), this structure is highly memory efficient.
+*   **State-of-the-Art Performance:** Outperforms standard, general-purpose data structures for both sequential and simultaneous weighted sampling.
+*   **Dual-Model Support:** Provides optimized methods for both Wallenius' (`select_and_remove`) and Fisher's (`select_many_and_remove`) distributions.
+*   **Effectively O(1) Complexity:** Core operations have a time complexity of `O(P)`, where `P` is the configured precision. This is effectively constant time, independent of the number of items.
+*   **Memory Efficient:** The combination of a sparse tree and Roaring Bitmaps makes it highly memory-efficient for most datasets.
 
 ---
-
-### Choosing the Right Tool: DigitBinIndex vs. General-Purpose Structures
-
-`DigitBinIndex` is a specialized data structure. Its design makes a deliberate engineering trade-off: it sacrifices a small, controllable amount of precision to gain significant improvements in speed and memory usage for its target use case.
-
-The standard, general-purpose tool for this type of problem is a **Fenwick Tree** (or Binary Indexed Tree), which can store the exact probability for every individual. Here is how they compare conceptually:
-
-| Feature | `DigitBinIndex` (This Crate) | Fenwick Tree (General-Purpose) |
-| :--- | :--- | :--- |
-| **Time Complexity** | **O(P)** <br>*(P = configured precision)* | **O(log N)** <br>*(N = number of individuals)* |
-| **Accuracy** | **Binned (Approximate)** <br>Quantizes probabilities to `P` decimal places. | **Perfect (Exact)** <br>Stores the precise probability for every item. |
-| **Ideal Data**| Empirical probabilities (from medicine, ML, etc.) where precision beyond a few digits is noise. | Theoretical probabilities (from physics, crypto, etc.) where high precision is meaningful. |
-
-This difference in time complexity leads to a dramatic performance gap in practice, as shown by the benchmark results below.
 
 ### Performance
 
-The following benchmarks compare the time for a single `select_and_remove` operation for both data structures across a growing number of individuals (`N`).
+`DigitBinIndex` makes a deliberate engineering trade-off: it sacrifices a small, controllable amount of precision by binning probabilities to gain significant improvements in speed.
+
+The standard alternative is a **Fenwick Tree**, which is perfectly accurate but has a slower `O(log N)` complexity. The benchmarks below compare `DigitBinIndex` against a highly optimized Fenwick Tree implementation.
+
+#### Wallenius' Draw (`select_and_remove`)
+
+This benchmark shows the time for a single sequential draw. `DigitBinIndex`'s `O(P)` complexity provides a consistent and significant performance advantage.
 
 | Number of Items (N) | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
 | :------------------ | :------------------- | :----------------- | :----------------- |
-| 100,000             | **~10.3 µs**         | ~5,579 µs (5.58 ms)  | **~542x faster**   |
-| 1,000,000           | **~346.1 µs**        | ~59,041 µs (59.0 ms) | **~171x faster**   |
-| 10,000,000          | **~739.1 µs**        | ~624,050 µs (624 ms) | **~844x faster**   |
+| 100,000             | **~16.7 µs**         | ~266.6 µs          | **~16x faster**    |
+| 1,000,000           | **~24.0 µs**         | ~1,042 µs (1.04 ms)  | **~43x faster**    |
 
-As the table shows, `DigitBinIndex` is not just faster; it is **orders of magnitude faster** for its intended use case.
+#### Fisher's Draw (`select_many_and_remove`)
 
-#### ✅ When to Choose DigitBinIndex
+This benchmark shows the time to draw 1% of the total population simultaneously. The Roaring Bitmap architecture gives `DigitBinIndex` a decisive edge over the Fenwick Tree's naive rejection sampling.
 
-This structure is the preferred choice when your scenario matches these conditions:
-*   **You have a very large number of items (`N` is in the millions).**
-*   **Performance is critical.**
-*   **Your probabilities are approximate.** If your weights come from empirical data, simulations, or machine learning models, the precision beyond a few decimal places is often meaningless.
-*   **Many items share the same effective probability.**
-
-#### ❌ When to Consider an Alternative (like a Fenwick Tree)
-
-You should use a more general-purpose data structure if:
-*   **You require perfect, lossless precision.** If all your items have unique probabilities that only differ at a high decimal place (e.g., the 15th digit), you would need to set `P` so high that the performance and memory benefits would be lost.
+| Number of Items (N) | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
+| :------------------ | :------------------- | :----------------- | :----------------- |
+| 10,000 (draw 100)   | **~113.4 µs**        | ~619.5 µs          | **~5.5x faster**   |
+| 100,000 (draw 1,000) | **~2,232 µs (2.23 ms)** | ~6,699 µs (6.7 ms)   | **~3x faster**     |
 
 ---
+
+### When to Choose DigitBinIndex
+
+This structure is the preferred choice when your scenario matches these conditions:
+*   **You need high-performance Wallenius' or Fisher's sampling.**
+*   **Your dataset is large (`N` > 100,000).**
+*   **Your probabilities are approximate.** If your weights come from empirical data, simulations, or ML models, the precision beyond a few decimal places is often meaningless.
+*   **Performance is more critical than perfect precision.**
+
+You should consider a more general-purpose data structure (like a Fenwick Tree) only if you require perfect, lossless precision *and* your data is "digitally incompressible" (e.g., all items differ only at a very high decimal place).
 
 ### Usage
 
@@ -74,10 +71,10 @@ First, add `digit-bin-index` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-digit-bin-index = "0.1.0" # Replace with the actual version
-fraction = "0.15" # This structure relies on the Decimal type
-rand = "0.9"
-```
+digit-bin-index = "0.2.0" # Use the latest version
+fraction = "0.14"
+rand = "0.8"
+roaring = "0.10"```
 
 Then, you can use it in your project:
 
@@ -91,27 +88,25 @@ fn main() {
 
     // Add individuals with unique IDs and associated weights.
     // Note: 0.12345 will be binned as 0.123 due to the precision.
-    index.add(101, Decimal::from(0.543));    // 0.543
-    index.add(102, Decimal::from(0.120));    // 0.120
-    index.add(103, Decimal::from(0.543));    // another 0.543
-    index.add(104, Decimal::from(0.12345));  // 0.12345
+    index.add(101, Decimal::from(0.543));
+    index.add(102, Decimal::from(0.120));
+    index.add(103, Decimal::from(0.543));
+    index.add(104, Decimal::from(0.12345));
 
-    println!(
-        "Initial state: {} individuals, total weight = {}",
-        index.count(),
-        index.total_weight()
-    );
+    println!("Initial state: {} individuals", index.count());
 
-    // select_and_remove() performs a weighted random selection and removes the item.
-    if let Some((selected_id, original_weight)) = index.select_and_remove() {
-        println!("\nSelected individual {} (weight ~{})", selected_id, original_weight);
+    // --- Wallenius' Draw (Sequential) ---
+    if let Some((id, _)) = index.select_and_remove() {
+        println!("Selected one individual (Wallenius'): {}", id);
     }
-
-    println!(
-        "Final state: {} individuals, total weight = {}",
-        index.count(),
-        index.total_weight()
-    );
+    
+    // --- Fisher's Draw (Simultaneous) ---
+    // Draw 2 unique individuals from the remaining population.
+    if let Some(ids) = index.select_many_and_remove(2) {
+        println!("Selected two individuals (Fisher's): {:?}", ids);
+    }
+    
+    println!("Final state: {} individuals", index.count());
 }
 ```
 

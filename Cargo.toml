@@ -1,6 +1,6 @@
 [package]
 name = "digit-bin-index"
-version = "0.1.0" 
+version = "0.2.0" 
 edition = "2021"
 authors = ["Lars Rönnbäck <lars.ronnback@anchormodeling.com>"] 
 license = "MIT" 
@@ -13,6 +13,7 @@ categories = ["data-structures", "algorithms", "science", "simulation"]
 [dependencies]
 fraction = "0.15"
 rand = "0.9"
+roaring = "0.11"
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }

@@ -9,6 +9,7 @@
 
 use fraction::{Decimal, Zero}; 
 use rand::Rng; 
+use roaring::RoaringBitmap;
 use std::collections::HashSet; 
 use std::vec;
 
@@ -20,8 +21,8 @@ const DEFAULT_PRECISION: u8 = 3;
 pub enum NodeContent {
     /// An internal node that contains children for the next digit (0-9).
     Internal(Vec<Node>),
-    /// A leaf node that contains a list of IDs for individuals in this bin.
-    Leaf(Vec<u32>),
+    /// A leaf node that contains a roaring bitmap of IDs for individuals in this bin.
+    Leaf(RoaringBitmap),
 }
 
 /// A node within the DigitBinIndex tree.
@@ -126,13 +127,11 @@ impl DigitBinIndex {
 
         if current_depth > max_depth {
             match &mut node.content {
-                NodeContent::Leaf(individuals) => individuals.push(individual_id),
+                NodeContent::Leaf(bitmap) => { bitmap.insert(individual_id); },
                 NodeContent::Internal(children) => {
                     if children.is_empty() {
-                        node.content = NodeContent::Leaf(vec![individual_id]);
-                    } else {
-                        panic!("Cannot add individual to a non-empty internal node at leaf depth.");
-                    }
+                        node.content = NodeContent::Leaf(RoaringBitmap::from_iter([individual_id]));
+                    } else { panic!("Cannot add individual to a non-empty internal node at leaf depth."); }
                 }
             }
             return;
@@ -181,23 +180,23 @@ impl DigitBinIndex {
         if num_to_draw > self.count() { return None; }
         if num_to_draw == 0 { return Some(HashSet::new()); }
 
-        let mut selected_ids = HashSet::with_capacity(num_to_draw as usize);
+        let mut selected_ids_bitmap = RoaringBitmap::new();
         let mut selections = Vec::with_capacity(num_to_draw as usize);
 
-        while selected_ids.len() < num_to_draw as usize {
-            if let Some((id, weight, path)) = self.weighted_find_unique(&selected_ids) {
-                if selected_ids.insert(id) {
+        while selected_ids_bitmap.len() < num_to_draw as u64 {
+            if let Some((id, weight, path)) = self.weighted_find_unique(&selected_ids_bitmap) {
+                if selected_ids_bitmap.insert(id) {
                     selections.push((path, id, weight));
                 }
             }
         }
 
         for (path, id, weight) in selections {
-            // --- FIX: Call the static helper method ---
             Self::update_and_remove_recurse(&mut self.root, &path, id, weight);
         }
 
-        Some(selected_ids)
+        // --- ROARING CHANGE: Convert the final bitmap to a HashSet for the public API ---
+        Some(selected_ids_bitmap.into_iter().collect())
     }
 
     /// Recursive helper to correctly update the tree and remove an item from a leaf.
@@ -206,9 +205,9 @@ impl DigitBinIndex {
         node.accumulated_value -= weight;
         
         let Some(&index) = path.first() else {
-            // If the path is empty, we are at the target node.
-            if let NodeContent::Leaf(individuals) = &mut node.content {
-                individuals.retain(|&x| x != id_to_remove);
+            if let NodeContent::Leaf(bitmap) = &mut node.content {
+                // --- ROARING CHANGE: Remove from the bitmap ---
+                bitmap.remove(id_to_remove);
             }
             return;
         };
@@ -222,7 +221,7 @@ impl DigitBinIndex {
     }
 
     /// Private helper to find a unique candidate using bin-aware rejection sampling.
-    fn weighted_find_unique(&self, selected_ids: &HashSet<u32>) -> Option<(u32, Decimal, Vec<usize>)> {
+    fn weighted_find_unique(&self, selected_ids: &RoaringBitmap) -> Option<(u32, Decimal, Vec<usize>)> {
         if self.root.content_count == 0 { return None; }
         let mut rng = rand::rng();
         let random_target = Decimal::from(rng.random_range(0.0..self.root.accumulated_value.try_into().unwrap()));
@@ -230,24 +229,22 @@ impl DigitBinIndex {
     }
 
     /// Recursive part of the unique find operation.
-    fn select_unique_recurse(
-        &self,
-        node: &Node,
-        mut target: Decimal,
-        mut path: Vec<usize>,
-        selected_ids: &HashSet<u32>,
-    ) -> Option<(u32, Decimal, Vec<usize>)> {
+    fn select_unique_recurse(&self, node: &Node, mut target: Decimal, mut path: Vec<usize>, selected_ids: &RoaringBitmap) -> Option<(u32, Decimal, Vec<usize>)> {
         match &node.content {
-            NodeContent::Leaf(individuals) => {
-                // The optimization: search the bin for any unselected individual.
-                for &id in individuals {
-                    if !selected_ids.contains(&id) {
-                        let weight = node.accumulated_value / Decimal::from(node.content_count);
-                        return Some((id, weight, path));
-                    }
+            NodeContent::Leaf(bitmap) => {
+                // --- ROARING CHANGE: THE CORE OPTIMIZATION ---
+                // 1. Perform a single, hyper-fast set difference operation.
+                let available_ids = bitmap - selected_ids;
+
+                // 2. Check if the bin is exhausted.
+                if available_ids.is_empty() {
+                    return None; // The bin is exhausted, trigger a full rejection.
                 }
-                // If all individuals in this bin are already selected, the bin is exhausted.
-                None
+
+                // 3. If not, just pick the very first available ID.
+                let id_to_select = available_ids.iter().next().unwrap();
+                let weight = node.accumulated_value / Decimal::from(node.content_count);
+                Some((id_to_select, weight, path))
             }
             NodeContent::Internal(children) => {
                 for (i, child) in children.iter().enumerate() {
@@ -270,14 +267,14 @@ impl DigitBinIndex {
         mut path: Vec<usize>,
     ) -> (u32, Decimal, Vec<usize>) {
         match &mut node.content {
-            NodeContent::Leaf(individuals) => {
-        let mut rng = rand::rng();
-                let rand_index = rng.random_range(0..individuals.len());
-                let selected_id = individuals.swap_remove(rand_index);
-                // The average weight of an item in this bin is the total accumulated value
-                // divided by the number of items *before* removal.
-                let weight = node.accumulated_value / Decimal::from(node.content_count);
+            NodeContent::Leaf(bitmap) => {
+                let mut rng = rand::rng();
+                // --- ROARING CHANGE: Select a random Nth element from the bitmap iterator ---
+                let bitmap_len = bitmap.len() as usize;
+                let rand_index = rng.random_range(0..bitmap_len);
+                let selected_id = bitmap.iter().nth(rand_index).unwrap(); // Get the Nth item.
 
+                let weight = node.accumulated_value / Decimal::from(node.content_count);
                 (selected_id, weight, path)
             }
             NodeContent::Internal(children) => {
