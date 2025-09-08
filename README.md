@@ -65,49 +65,60 @@ This structure is the preferred choice when your scenario matches these conditio
 
 You should consider a more general-purpose data structure (like a Fenwick Tree) only if you require perfect, lossless precision *and* your data is "digitally incompressible" (e.g., all items differ only at a very high decimal place).
 
+---
+
 ### Usage
 
-First, add `digit-bin-index` to your `Cargo.toml`:
+First, add `digit-bin-index` and its dependencies to your `Cargo.toml`. The library uses the `rust_decimal` crate for high-performance, precise decimal arithmetic.
 
 ```toml
 [dependencies]
-digit-bin-index = "0.2.0" # Use the latest version
-fraction = "0.14"
-rand = "0.8"
+digit-bin-index = "0.2.1" # Use the latest version
+rust_decimal = { version = "1.32", features = ["rand"] }
 roaring = "0.10"
+rand = "0.8"
 ```
 
-Then, you can use it in your project:
+Then, you can use `DigitBinIndex` in your project to perform both sequential (Wallenius') and simultaneous (Fisher's) draws.
 
 ```rust
 use digit_bin_index::DigitBinIndex;
-use fraction::Decimal;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec; // For easy decimal creation
 
 fn main() {
     // Create an index with a precision of 3 decimal places.
     let mut index = DigitBinIndex::with_precision(3);
 
     // Add individuals with unique IDs and associated weights.
-    // Note: 0.12345 will be binned as 0.123 due to the precision.
-    index.add(101, Decimal::from(0.543));
-    index.add(102, Decimal::from(0.120));
-    index.add(103, Decimal::from(0.543));
-    index.add(104, Decimal::from(0.12345));
+    // The `dec!` macro is a convenient way to create decimals.
+    index.add(101, dec!(0.543));
+    index.add(102, dec!(0.120));
+    index.add(103, dec!(0.543)); // A duplicate weight is fine.
+    index.add(104, dec!(0.810));
+    index.add(105, dec!(0.12345)); // Note: this will be binned as 0.123
 
-    println!("Initial state: {} individuals", index.count());
+    println!(
+        "Initial state: {} individuals, total weight = {}",
+        index.count(),
+        index.total_weight()
+    );
 
-    // --- Wallenius' Draw (Sequential) ---
+    // --- 1. Wallenius' Draw (Sequential) ---
+    // Select one item, which is immediately removed. The odds change for the next draw.
     if let Some((id, _)) = index.select_and_remove() {
-        println!("Selected one individual (Wallenius'): {}", id);
+        println!("\nSelected one individual (Wallenius' draw): {}", id);
+        println!("State after one draw: {} individuals", index.count());
     }
     
-    // --- Fisher's Draw (Simultaneous) ---
-    // Draw 2 unique individuals from the remaining population.
+    // --- 2. Fisher's Draw (Simultaneous) ---
+    // Select a batch of 2 unique individuals from the remaining population.
+    // This is a single, atomic operation.
     if let Some(ids) = index.select_many_and_remove(2) {
-        println!("Selected two individuals (Fisher's): {:?}", ids);
+        println!("\nSelected two individuals (Fisher's draw): {:?}", ids);
     }
     
-    println!("Final state: {} individuals", index.count());
+    println!("\nFinal state: {} individuals", index.count());
 }
 ```
 
