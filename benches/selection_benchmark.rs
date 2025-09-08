@@ -1,23 +1,23 @@
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, PlotConfiguration, Throughput, AxisScale,
 };
-// --- Switch to rust_decimal ---
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
-// --- And bring in the necessary traits ---
-use num_traits::{One, Zero};
+use digit_bin_index::DigitBinIndex; // Use your actual crate name
 use rand::Rng;
+use rust_decimal::Decimal;
 use std::collections::HashSet;
+use std::convert::TryFrom;
+use std::hint::black_box;
 
-// --- A FenwickTree using rust_decimal ---
-// (This is now much faster due to the fast arithmetic)
+// --- Competitor Implementation: Fenwick Tree ---
+#[derive(Clone)]
 struct FenwickTree {
     tree: Vec<Decimal>,
     original_weights: Vec<Decimal>,
 }
+
 impl FenwickTree {
     fn new(size: usize) -> Self {
-        Self { tree: vec![Decimal::zero(); size + 1], original_weights: vec![Decimal::zero(); size] }
+        Self { tree: vec![Decimal::ZERO; size + 1], original_weights: vec![Decimal::ZERO; size] }
     }
     fn add(&mut self, mut index: usize, delta: Decimal) {
         if !delta.is_zero() && self.original_weights[index].is_zero() { self.original_weights[index] = delta; }
@@ -30,7 +30,7 @@ impl FenwickTree {
     fn find(&self, target: Decimal) -> usize {
         let mut target = target;
         let mut current_index = 0;
-        let mut bit_mask = 1 << (self.tree.len().next_power_of_two().trailing_zeros() - 1);
+        let mut bit_mask = 1 << (self.tree.len().next_power_of_two().trailing_zeros() as u32 - 1);
         while bit_mask != 0 {
             let test_index = current_index + bit_mask;
             if test_index < self.tree.len() && target >= self.tree[test_index] {
@@ -42,69 +42,116 @@ impl FenwickTree {
         current_index
     }
     fn total_weight(&self) -> Decimal { self.original_weights.iter().sum() }
+
+    // Wallenius' draw helper
+    fn wallenius_select_and_remove(&mut self, current_total: Decimal) -> Option<usize> {
+        if current_total.is_zero() { return None; }
+        let mut rng = rand::thread_rng();
+        let random_target = rng.gen_range(Decimal::ZERO..current_total);
+        let index = self.find(random_target);
+        if index < self.original_weights.len() { self.add(index, -self.original_weights[index]); }
+        Some(index)
+    }
+
+    // Fisher's draw helper (naive rejection sampling)
+    fn fisher_select_many_and_remove(&mut self, num_to_draw: u32) -> Option<HashSet<usize>> {
+        if num_to_draw as usize > self.original_weights.len() { return None; }
+        let total_weight = self.total_weight();
+        if total_weight.is_zero() { return Some(HashSet::new()); }
+        let mut selected_ids = HashSet::with_capacity(num_to_draw as usize);
+        let mut rng = rand::thread_rng();
+
+        // 1. Selection Phase (Rejection Sampling)
+        while selected_ids.len() < num_to_draw as usize {
+            let random_target = rng.gen_range(Decimal::ZERO..total_weight);
+            let candidate_id = self.find(random_target);
+            selected_ids.insert(candidate_id);
+        }
+
+        // 2. Update Phase
+        for &id in &selected_ids {
+            if id < self.original_weights.len() { self.add(id, -self.original_weights[id]); }
+        }
+        Some(selected_ids.iter().copied().collect())
+    }
 }
 
-
-// --- THE NEW, CORRECT BENCHMARK ---
-fn benchmark_simulation_loop(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Simulation Loop (1000 draws)");
+// --- Benchmark Suite 1: Wallenius Draw Simulation Loop ---
+fn benchmark_wallenius_draw(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Wallenius Draw (1000 Selections)");
     let plot_config = PlotConfiguration::default().summary_scale(AxisScale::Logarithmic);
     group.plot_config(plot_config);
-    
     let num_draws = 1000;
 
     for &n in &[100_000, 1_000_000] {
-        // Throughput is now the number of draws we are performing.
         group.throughput(Throughput::Elements(num_draws as u64));
-
-        // Setup the initial weights (this part is not timed)
         let mut rng = rand::thread_rng();
         let weights: Vec<Decimal> = (0..n)
-            .map(|_| Decimal::from_f64(rng.gen_range(0.0..1.0) / n as f64).unwrap_or_default())
+            .map(|_| Decimal::try_from(rng.gen_range(0.0..1.0) / n as f64).unwrap_or_default())
             .collect();
 
-        // --- DigitBinIndex Benchmark ---
-        group.bench_with_input(BenchmarkId::new("DigitBinIndex", n), &n, |b, &n| {
-            // Setup: Build the index ONCE.
-            let mut dbi = your_crate_name::DigitBinIndex::with_precision(5); // Replace with your crate name
-            for (i, &weight) in weights.iter().enumerate() { dbi.add(i as u32, weight); }
-
-            // Action: The timed portion is the ENTIRE loop.
-            b.iter(|| {
-                // We must clone the index to not exhaust it during the benchmark.
-                let mut dbi_clone = dbi.clone();
-                for _ in 0..num_draws {
-                    // Use criterion::black_box to prevent the compiler from optimizing away the loop.
-                    criterion::black_box(dbi_clone.select_and_remove());
-                }
-            });
+        group.bench_with_input(BenchmarkId::new("DigitBinIndex", n), &n, |b, _| {
+            b.iter_batched(|| {
+                let mut dbi = DigitBinIndex::with_precision(5);
+                for (i, &weight) in weights.iter().enumerate() { dbi.add(i as u32, weight); }
+                dbi
+            }, |mut dbi| { for _ in 0..num_draws { black_box(dbi.select_and_remove()); } }, criterion::BatchSize::SmallInput);
         });
 
-        // --- FenwickTree Benchmark ---
-        group.bench_with_input(BenchmarkId::new("FenwickTree", n), &n, |b, &n| {
-            // Setup: Build the tree ONCE.
-            let mut ft = FenwickTree::new(n);
-            for (i, &weight) in weights.iter().enumerate() { ft.add(i, weight); }
-            
-            // Action: The timed portion is the ENTIRE loop.
-            b.iter(|| {
-                let mut ft_clone = ft.clone(); // Clone to not exhaust it.
-                let mut total_weight = ft_clone.total_weight();
+        group.bench_with_input(BenchmarkId::new("FenwickTree", n), &n, |b, _| {
+            b.iter_batched(|| {
+                let mut ft = FenwickTree::new(n);
+                for (i, &weight) in weights.iter().enumerate() { ft.add(i, weight); }
+                ft
+            }, |mut ft| {
+                let mut total_weight = ft.total_weight();
                 for _ in 0..num_draws {
-                    if let Some(index_removed) = criterion::black_box(ft_clone.select_and_remove(total_weight)) {
-                        total_weight -= ft_clone.original_weights[index_removed];
-                    }
+                    if let Some(index_removed) = ft.wallenius_select_and_remove(total_weight) {
+                        if index_removed < ft.original_weights.len() { total_weight -= ft.original_weights[index_removed]; }
+                    } else { break; }
                 }
-            });
+            }, criterion::BatchSize::SmallInput);
         });
     }
     group.finish();
 }
 
-// You will need to make your structs cloneable: `#[derive(Debug, Clone)]`
-// And update the crate name `your_crate_name` to your actual crate name.
-// Also, I've noticed you are using `fraction::Decimal` in the provided benchmark, 
-// if you switched to `rust_decimal`, ensure all types are consistent.
+// --- Benchmark Suite 2: Fisher's Draw (Single Batch) ---
+fn benchmark_fisher_draw(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Fisher's Draw (Simultaneous Selection)");
+    let plot_config = PlotConfiguration::default().summary_scale(AxisScale::Logarithmic);
+    group.plot_config(plot_config);
 
-criterion_group!(benches, benchmark_simulation_loop);
+    for &n in &[100_000, 1_000_000] {
+        // Test drawing 1% of the population
+        let k = n / 100;
+        group.throughput(Throughput::Elements(k as u64));
+        let mut rng = rand::thread_rng();
+        let weights: Vec<Decimal> = (0..n)
+            .map(|_| Decimal::try_from(rng.gen_range(0.0..1.0) / n as f64).unwrap_or_default())
+            .collect();
+        
+        // Use a more descriptive ID for the benchmark
+        let bench_id = format!("N={}, k={}", n, k);
+
+        group.bench_with_input(BenchmarkId::new("DigitBinIndex", &bench_id), &k, |b, &k| {
+            b.iter_batched(|| {
+                let mut dbi = DigitBinIndex::with_precision(5);
+                for (i, &weight) in weights.iter().enumerate() { dbi.add(i as u32, weight); }
+                dbi
+            }, |mut dbi| { black_box(dbi.select_many_and_remove(k as u32)); }, criterion::BatchSize::SmallInput);
+        });
+
+        group.bench_with_input(BenchmarkId::new("FenwickTree", &bench_id), &k, |b, &k| {
+            b.iter_batched(|| {
+                let mut ft = FenwickTree::new(n);
+                for (i, &weight) in weights.iter().enumerate() { ft.add(i, weight); }
+                ft
+            }, |mut ft| { black_box(ft.fisher_select_many_and_remove(k as u32)); }, criterion::BatchSize::SmallInput);
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, benchmark_wallenius_draw, benchmark_fisher_draw);
 criterion_main!(benches);

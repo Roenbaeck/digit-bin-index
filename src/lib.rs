@@ -33,7 +33,7 @@ pub struct Node {
     /// The total sum of probabilities stored under this node.
     pub accumulated_value: Decimal,
     /// The total count of individuals stored under this node.
-    pub content_count: u32,
+    pub content_count: u32, 
 }
 
 impl Node {
@@ -97,6 +97,7 @@ impl DigitBinIndex {
 
     /// Helper function to get the digit at a certain decimal position.
     fn get_digit_at(weight: Decimal, position: u8) -> usize {
+        let position = position as u32;
         // Get the number of decimal places (scale)
         let scale = weight.scale();
 
@@ -113,7 +114,7 @@ impl DigitBinIndex {
         // 10^(3-1) = 100.
         // 543 / 100 = 5.
         // 5 % 10 = 5. That's our digit.
-        let power_of_10 = 10u128.pow(scale - position as u32);
+        let power_of_10 = 10u128.pow(scale - position);
         let digit = (mantissa / power_of_10) % 10;
         
         digit as usize
@@ -266,7 +267,7 @@ impl DigitBinIndex {
                     }
                     target -= child.accumulated_value;
                 }
-                panic!("Selection logic failed: target exceeded total value of children.");
+                None
             }
         }
     }
@@ -281,7 +282,7 @@ impl DigitBinIndex {
             NodeContent::Leaf(bitmap) => {
                 let mut rng = rand::thread_rng();
                 // --- ROARING CHANGE: Select a random Nth element from the bitmap iterator ---
-                let bitmap_len = bitmap.len() as usize;
+                let bitmap_len = bitmap.len() as u32;
                 let rand_index = rng.gen_range(0..bitmap_len);
                 let selected_id = bitmap.select(rand_index).unwrap(); // Get the Nth item.
 
@@ -333,7 +334,7 @@ impl DigitBinIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fraction::{Decimal};
+    use rust_decimal_macros::dec;
 
     #[test]
     fn test_wallenius_distribution_is_correct() {
@@ -342,8 +343,8 @@ mod tests {
         const TOTAL_ITEMS: u32 = ITEMS_PER_GROUP * 2;
         const NUM_DRAWS: u32 = TOTAL_ITEMS / 2;
 
-        let low_risk_weight = Decimal::from(0.1); // 0.1
-        let high_risk_weight = Decimal::from(0.2); // 0.2
+        let low_risk_weight = dec!(0.1);  // 0.1
+        let high_risk_weight = dec!(0.2); // 0.2
 
         // --- Execution: Run many simulations to average out randomness ---
         const NUM_SIMULATIONS: u32 = 100;
@@ -403,8 +404,10 @@ mod tests {
         const ITEMS_PER_GROUP: u32 = 1000;
         const TOTAL_ITEMS: u32 = ITEMS_PER_GROUP * 2;
         const NUM_DRAWS: u32 = TOTAL_ITEMS / 2;
-        let low_risk_weight = Decimal::from(0.1);
-        let high_risk_weight = Decimal::from(0.2);
+
+        let low_risk_weight = dec!(0.1);  // 0.1
+        let high_risk_weight = dec!(0.2); // 0.2
+
         const NUM_SIMULATIONS: u32 = 100;
         let mut total_high_risk_selected = 0;
 

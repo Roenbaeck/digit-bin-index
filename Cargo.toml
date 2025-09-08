@@ -11,7 +11,7 @@ keywords = ["statistics", "probability", "weighted-sampling", "simulation", "dat
 categories = ["data-structures", "algorithms", "science", "simulation"] 
 
 [dependencies]
-rust_decimal = "1.37"
+rust_decimal = { version = "1.37", features = ["rand"] }
 rust_decimal_macros = "1.37"
 rand = "0.8" # rust_decimal does not yet support rand 0.9
 roaring = "0.11"

@@ -1,0 +1,10 @@
+{
+    "name": "Cargo",
+    "image": "mcr.microsoft.com/devcontainers/base:jammy",
+
+    // Install Cargo when the devcontainer is made
+    "onCreateCommand": "curl https://sh.rustup.rs -sSf | sh -s -- -y",
+
+    // Install Cargo dependencies after the devcontainer is made
+    "postCreateCommand": ". $HOME/.cargo/env && cargo install aftman"
+}
