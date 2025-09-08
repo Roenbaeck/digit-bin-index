@@ -35,23 +35,23 @@ In many simulations, forecasts, or statistical models, one needs to manage a lar
 
 The standard alternative is a **Fenwick Tree**, which is perfectly accurate but has a slower `O(log N)` complexity. The benchmarks below compare `DigitBinIndex` against a highly optimized Fenwick Tree implementation.
 
-#### Wallenius' Draw (`select_and_remove`)
+#### Wallenius' Draw (Sequential Selections)
 
-This benchmark shows the time for a single sequential draw. `DigitBinIndex`'s `O(P)` complexity provides a consistent and significant performance advantage.
+This benchmark measures the total time to perform a loop of 1,000 `select_and_remove` operations, simulating a real-world workload. The results show `DigitBinIndex`'s superior `O(P)` complexity provides a massive and growing advantage as the dataset size increases.
 
-| Number of Items (N) | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
-| :------------------ | :------------------- | :----------------- | :----------------- |
-| 100,000             | **~16.7 µs**         | ~266.6 µs          | **~16x faster**    |
-| 1,000,000           | **~24.0 µs**         | ~1,042 µs (1.04 ms)  | **~43x faster**    |
+| Number of Items (N) | `DigitBinIndex` Loop Time | `FenwickTree` Loop Time | **Speedup Factor** |
+| :------------------ | :---------------------- | :-------------------- | :----------------- |
+| 100,000             | **~0.99 ms**            | ~2.93 ms              | **~3.0x faster**   |
+| 1,000,000           | **~1.18 ms**            | ~22.06 ms             | **~18.7x faster**  |
 
-#### Fisher's Draw (`select_many_and_remove`)
+#### Fisher's Draw (Simultaneous Selections)
 
-This benchmark shows the time to draw 1% of the total population simultaneously. The Roaring Bitmap architecture gives `DigitBinIndex` a decisive edge over the Fenwick Tree's naive rejection sampling.
+This benchmark measures the time to select a single batch of unique items (1% of the total population). `DigitBinIndex` uses a "bin-aware" selection algorithm powered by Roaring Bitmaps, while the `FenwickTree` uses naive rejection sampling.
 
-| Number of Items (N) | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
-| :------------------ | :------------------- | :----------------- | :----------------- |
-| 10,000 (draw 100)   | **~113.4 µs**        | ~619.5 µs          | **~5.5x faster**   |
-| 100,000 (draw 1,000) | **~2,232 µs (2.23 ms)** | ~6,699 µs (6.7 ms)   | **~3x faster**     |
+| Scenario (N items, draw k) | `DigitBinIndex` Time | `FenwickTree` Time | **Winner & Speedup** |
+| :------------------------- | :------------------- | :----------------- | :------------------- |
+| N=100k, k=1k               | **~1.52 ms**         | ~2.95 ms           | **`DigitBinIndex` (~1.9x faster)** |
+| N=1M, k=10k                | ~61.7 ms             | **~35.1 ms**         | **`FenwickTree` (~1.75x faster)** |
 
 ---
 
