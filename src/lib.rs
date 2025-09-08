@@ -7,7 +7,7 @@
 //! particularly for simulations involving sequential sampling like Wallenius'
 //! noncentral hypergeometric distribution.
 
-use fraction::{Decimal, Zero}; 
+use rust_decimal::Decimal;
 use rand::Rng; 
 use roaring::RoaringBitmap;
 use std::collections::HashSet; 
@@ -97,14 +97,26 @@ impl DigitBinIndex {
 
     /// Helper function to get the digit at a certain decimal position.
     fn get_digit_at(weight: Decimal, position: u8) -> usize {
-        let s = weight.to_string();
-        if let Some(dot_pos) = s.find('.') {
-            let digit_pos = dot_pos + (position as usize);
-            if digit_pos < s.len() {
-                return s.chars().nth(digit_pos).unwrap().to_digit(10).unwrap() as usize;
-            }
+        // Get the number of decimal places (scale)
+        let scale = weight.scale();
+
+        // The number isn't that precise
+        if position > scale {
+            return 0;
         }
-        0 // Return 0 if precision is higher than number of decimals.
+        
+        // Use the absolute value of the mantissa to correctly handle negative decimals.
+        let mantissa = weight.mantissa().abs() as u128;
+        
+        // Example for position=1 (the first decimal digit):
+        // For 0.543, mantissa=543, scale=3. We want '5'.
+        // 10^(3-1) = 100.
+        // 543 / 100 = 5.
+        // 5 % 10 = 5. That's our digit.
+        let power_of_10 = 10u128.pow(scale - position as u32);
+        let digit = (mantissa / power_of_10) % 10;
+        
+        digit as usize
     }
 
     /// Adds an individual with a specific weight (probability) to the index.
@@ -159,9 +171,8 @@ impl DigitBinIndex {
             return None;
         }
         
-        // --- FIX: Use the modern, fully-qualified call ---
-        let mut rng = rand::rng();
-        let random_target = Decimal::from(rng.random_range(0.0..self.root.accumulated_value.try_into().unwrap()));
+        let mut rng = rand::thread_rng();
+        let random_target = rng.gen_range(Decimal::ZERO..self.root.accumulated_value);
         
         let (selected_id, weight, path) = Self::select_recurse(&mut self.root, random_target, vec![]);
         self.update_values_post_removal(&path, weight);
@@ -223,8 +234,8 @@ impl DigitBinIndex {
     /// Private helper to find a unique candidate using bin-aware rejection sampling.
     fn weighted_find_unique(&self, selected_ids: &RoaringBitmap) -> Option<(u32, Decimal, Vec<usize>)> {
         if self.root.content_count == 0 { return None; }
-        let mut rng = rand::rng();
-        let random_target = Decimal::from(rng.random_range(0.0..self.root.accumulated_value.try_into().unwrap()));
+        let mut rng = rand::thread_rng();
+        let random_target = rng.gen_range(Decimal::ZERO..self.root.accumulated_value);
         self.select_unique_recurse(&self.root, random_target, vec![], selected_ids)
     }
 
@@ -242,7 +253,7 @@ impl DigitBinIndex {
                 }
 
                 // 3. If not, just pick the very first available ID.
-                let id_to_select = available_ids.iter().next().unwrap();
+                let id_to_select = available_ids.select(0).unwrap();
                 let weight = node.accumulated_value / Decimal::from(node.content_count);
                 Some((id_to_select, weight, path))
             }
@@ -268,11 +279,11 @@ impl DigitBinIndex {
     ) -> (u32, Decimal, Vec<usize>) {
         match &mut node.content {
             NodeContent::Leaf(bitmap) => {
-                let mut rng = rand::rng();
+                let mut rng = rand::thread_rng();
                 // --- ROARING CHANGE: Select a random Nth element from the bitmap iterator ---
                 let bitmap_len = bitmap.len() as usize;
-                let rand_index = rng.random_range(0..bitmap_len);
-                let selected_id = bitmap.iter().nth(rand_index).unwrap(); // Get the Nth item.
+                let rand_index = rng.gen_range(0..bitmap_len);
+                let selected_id = bitmap.select(rand_index).unwrap(); // Get the Nth item.
 
                 let weight = node.accumulated_value / Decimal::from(node.content_count);
                 (selected_id, weight, path)

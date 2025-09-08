@@ -1,7 +1,8 @@
 // examples/simulation.rs
 
 use digit_bin_index::DigitBinIndex;
-use fraction::Decimal;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 fn main() {
     println!("--- Simulation 1: Default Precision (3) ---");
