@@ -192,23 +192,64 @@ impl DigitBinIndex {
         if num_to_draw > self.count() { return None; }
         if num_to_draw == 0 { return Some(HashSet::new()); }
 
-        let mut selected_ids_bitmap = RoaringBitmap::new();
-        let mut selections = Vec::with_capacity(num_to_draw as usize);
+        let mut selected_items = Vec::with_capacity(num_to_draw as usize);
+        let mut selected_ids = HashSet::with_capacity(num_to_draw as usize);
+        let mut rng = rand::thread_rng();
 
-        while selected_ids_bitmap.len() < num_to_draw as u64 {
-            if let Some((id, weight, path)) = self.weighted_find_unique(&selected_ids_bitmap) {
-                if selected_ids_bitmap.insert(id) {
-                    selections.push((path, id, weight));
+        // --- Phase 1: Selection via Simple Rejection Sampling ---
+        // We sample from the original, unaltered tree until we find num_to_draw unique items.
+        while selected_ids.len() < num_to_draw as usize {
+            // We can reuse the core recursive find logic, but we don't need to pass the selected_ids down.
+            // Let's create a simplified find helper for this.
+            let random_target = rng.gen_range(Decimal::ZERO..self.root.accumulated_value);
+            if let Some((id, weight, path)) = self.find_candidate_recurse(&self.root, random_target, vec![]) {
+                if selected_ids.insert(id) {
+                    // It's a new, unique item. Store its full info for the update phase.
+                    selected_items.push((path, id, weight));
                 }
+            } else {
+                // This should not happen in a non-empty tree.
+                return None; 
             }
         }
 
-        for (path, id, weight) in selections {
+        // --- Phase 2: Batched Update ---
+        // Now that we have all our unique items, update the tree in one go.
+        for (path, id, weight) in selected_items {
+            // This is your original update function. It will handle the content_count and accumulated_value.
+            // It does NOT need to touch available_count.
             Self::update_and_remove_recurse(&mut self.root, &path, id, weight);
         }
+        
+        Some(selected_ids)
+    }
 
-        // --- ROARING CHANGE: Convert the final bitmap to a HashSet for the public API ---
-        Some(selected_ids_bitmap.into_iter().collect())
+    /// A simplified recursive find that does not check for uniqueness.
+    /// It's used by the rejection sampling method.
+    fn find_candidate_recurse(&self, node: &Node, mut target: Decimal, mut path: Vec<usize>) -> Option<(u32, Decimal, Vec<usize>)> {
+        match &node.content {
+            NodeContent::Leaf(bitmap) => {
+                if bitmap.is_empty() { return None; }
+                let mut rng = rand::thread_rng();
+                // In a simple leaf, any member is a valid candidate.
+                let rand_index = rng.gen_range(0..bitmap.len() as u32);
+                let selected_id = bitmap.select(rand_index).unwrap();
+
+                let weight = node.accumulated_value / Decimal::from(node.content_count);
+                Some((selected_id, weight, path))
+            }
+            NodeContent::Internal(children) => {
+                for (i, child) in children.iter().enumerate() {
+                    if child.accumulated_value.is_zero() { continue; }
+                    if target < child.accumulated_value {
+                        path.push(i);
+                        return self.find_candidate_recurse(child, target, path);
+                    }
+                    target -= child.accumulated_value;
+                }
+                None // Should not be reached if total weight is consistent
+            }
+        }
     }
 
     /// Recursive helper to correctly update the tree and remove an item from a leaf.
@@ -228,46 +269,6 @@ impl DigitBinIndex {
             if let Some(child) = children.get_mut(index) {
                 // The recursive call is now to the static method itself.
                 Self::update_and_remove_recurse(child, &path[1..], id_to_remove, weight);
-            }
-        }
-    }
-
-    /// Private helper to find a unique candidate using bin-aware rejection sampling.
-    fn weighted_find_unique(&self, selected_ids: &RoaringBitmap) -> Option<(u32, Decimal, Vec<usize>)> {
-        if self.root.content_count == 0 { return None; }
-        let mut rng = rand::thread_rng();
-        let random_target = rng.gen_range(Decimal::ZERO..self.root.accumulated_value);
-        self.select_unique_recurse(&self.root, random_target, vec![], selected_ids)
-    }
-
-    /// Recursive part of the unique find operation.
-    fn select_unique_recurse(&self, node: &Node, mut target: Decimal, mut path: Vec<usize>, selected_ids: &RoaringBitmap) -> Option<(u32, Decimal, Vec<usize>)> {
-        match &node.content {
-            NodeContent::Leaf(bitmap) => {
-                // --- ROARING CHANGE: THE CORE OPTIMIZATION ---
-                // 1. Perform a single, hyper-fast set difference operation.
-                let available_ids = bitmap - selected_ids;
-
-                // 2. Check if the bin is exhausted.
-                if available_ids.is_empty() {
-                    return None; // The bin is exhausted, trigger a full rejection.
-                }
-
-                // 3. If not, just pick the very first available ID.
-                let id_to_select = available_ids.select(0).unwrap();
-                let weight = node.accumulated_value / Decimal::from(node.content_count);
-                Some((id_to_select, weight, path))
-            }
-            NodeContent::Internal(children) => {
-                for (i, child) in children.iter().enumerate() {
-                    if child.accumulated_value.is_zero() { continue; }
-                    if target < child.accumulated_value {
-                        path.push(i);
-                        return self.select_unique_recurse(child, target, path, selected_ids);
-                    }
-                    target -= child.accumulated_value;
-                }
-                None
             }
         }
     }
@@ -308,6 +309,7 @@ impl DigitBinIndex {
         let mut current_node = &mut self.root;
         current_node.content_count -= 1;
         current_node.accumulated_value -= weight;
+
         for &index in path {
             if let NodeContent::Internal(children) = &mut current_node.content {
                 current_node = &mut children[index];

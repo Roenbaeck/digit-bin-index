@@ -29,6 +29,12 @@ In many simulations, forecasts, or statistical models, one needs to manage a lar
 
 ---
 
+Of course. Those results are not just an improvement; they are a complete reversal and a resounding success. The change in algorithm for the Fisher's draw was clearly the right move. Congratulations!
+
+Here is the updated performance section for your README, populated with the new, phenomenal results.
+
+***
+
 ### Performance
 
 `DigitBinIndex` makes a deliberate engineering trade-off: it sacrifices a small, controllable amount of precision by binning probabilities to gain significant improvements in speed.
@@ -37,21 +43,23 @@ The standard alternative is a **Fenwick Tree**, which is perfectly accurate but 
 
 #### Wallenius' Draw (Sequential Selections)
 
-This benchmark measures the total time to perform a loop of 1,000 `select_and_remove` operations, simulating a real-world workload. The results show `DigitBinIndex`'s superior `O(P)` complexity provides a massive and growing advantage as the dataset size increases.
+This benchmark measures the total time to perform a loop of 1,000 `select_and_remove` operations. The results show `DigitBinIndex`'s superior `O(P)` complexity provides a massive and growing advantage as the dataset size increases.
 
 | Number of Items (N) | `DigitBinIndex` Loop Time | `FenwickTree` Loop Time | **Speedup Factor** |
 | :------------------ | :---------------------- | :-------------------- | :----------------- |
-| 100,000             | **~0.99 ms**            | ~2.93 ms              | **~3.0x faster**   |
-| 1,000,000           | **~1.18 ms**            | ~22.06 ms             | **~18.7x faster**  |
+| 100,000             | **~0.46 ms**            | ~1.77 ms              | **~3.9x faster**   |
+| 1,000,000           | **~0.52 ms**            | ~13.58 ms             | **~26.1x faster**  |
 
 #### Fisher's Draw (Simultaneous Selections)
 
-This benchmark measures the time to select a single batch of unique items (1% of the total population). `DigitBinIndex` uses a "bin-aware" selection algorithm powered by Roaring Bitmaps, while the `FenwickTree` uses naive rejection sampling.
+This benchmark measures the time to select a single batch of unique items (1% of the total population). After algorithmic improvements, `DigitBinIndex` now uses a batched rejection sampling approach that is significantly more efficient than its previous method and faster than the Fenwick Tree's equivalent.
 
-| Scenario (N items, draw k) | `DigitBinIndex` Time | `FenwickTree` Time | **Winner & Speedup** |
-| :------------------------- | :------------------- | :----------------- | :------------------- |
-| N=100k, k=1k               | **~1.52 ms**         | ~2.95 ms           | **`DigitBinIndex` (~1.9x faster)** |
-| N=1M, k=10k                | ~61.7 ms             | **~35.1 ms**         | **`FenwickTree` (~1.75x faster)** |
+| Scenario (N items, draw k) | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
+| :------------------------- | :------------------- | :----------------- | :----------------- |
+| N=100k, k=1k               | **~0.47 ms**         | ~1.87 ms           | **~4.0x faster**   |
+| N=1M, k=10k                | **~5.48 ms**         | ~20.16 ms          | **~3.7x faster**   |
+
+As the results show, `DigitBinIndex` outperforms the Fenwick Tree in both sequential and simultaneous batched selection scenarios, making it a highly effective tool for large-scale weighted random sampling simulations.
 
 ---
 
