@@ -100,9 +100,60 @@ Here is a summary to help guide your choice:
 
 ---
 
-### Usage
+### Usage & Installation
 
-First, add `digit-bin-index` to your project's dependencies in `Cargo.toml`. You will also need `rust_decimal` because it is used in the public API for defining item weights.
+This package can be used as a Python library from PyPI or as a Rust crate from Crates.io.
+
+### For Python 🐍
+
+Install the package from PyPI:
+
+```bash
+pip install digit-bin-index
+```
+
+Then, you can use `DigitBinIndex` in your Python projects to perform both sequential (Wallenius') and simultaneous (Fisher's) draws.
+
+```python
+from digit_bin_index import DigitBinIndex
+
+def main():
+    # Create a new index with a precision of 3 decimal places.
+    index = DigitBinIndex(precision=3)
+
+    # Add individuals with their ID and a specific weight.
+    index.add(id=101, weight=0.123)  # Low weight
+    index.add(id=202, weight=0.800)  # High weight
+    index.add(id=303, weight=0.755)  # High weight
+    index.add(id=404, weight=0.110)  # Low weight
+
+    # --- Example 1: Sequential (Wallenius') Draw ---
+    # Select one item, which is removed from the pool for subsequent draws.
+    # The higher weighted items (202, 303) are more likely to be chosen.
+    selected_item = index.select_and_remove()
+    if selected_item:
+        # Returns a tuple of (id, weight_as_string)
+        print(f"Wallenius draw selected: ID {selected_item[0]}, Weight ~{selected_item[1]}")
+    
+    print(f"Items remaining: {index.count()}")  # Will be 3
+
+    # --- Example 2: Simultaneous (Fisher's) Draw ---
+    # Select a batch of 2 unique items.
+    # This is more efficient than calling select_and_remove() in a loop.
+    selected_ids = index.select_many_and_remove(2)
+    if selected_ids:
+        # Returns a list of IDs
+        print(f"Fisher's draw selected IDs: {selected_ids}")
+    
+    print(f"Items remaining: {index.count()}")  # Will be 1
+
+if __name__ == "__main__":
+    main()
+```
+
+### For Rust 🦀
+
+Add `digit-bin-index` to your project's `Cargo.toml`. You will also need `rust_decimal` for defining item weights.
 
 ```toml
 [dependencies]
@@ -111,7 +162,7 @@ rust_decimal = "1.37"        # The decimal type used in the API
 rust_decimal_macros = "1.37" # Recommended for easily creating decimals
 ```
 
-Then, you can use `DigitBinIndex` in your project to perform both sequential (Wallenius') and simultaneous (Fisher's) draws.
+Then, you can use `DigitBinIndex` in your project:
 
 ```rust
 use digit_bin_index::DigitBinIndex;
@@ -129,7 +180,6 @@ fn main() {
 
     // --- Example 1: Sequential (Wallenius') Draw ---
     // Select one item, which is removed from the pool for subsequent draws.
-    // The higher weighted items (202, 303) are more likely to be chosen.
     if let Some((selected_id, approx_weight)) = index.select_and_remove() {
         println!("Wallenius draw selected: ID {}, Weight ~{}", selected_id, approx_weight);
     }
@@ -137,7 +187,6 @@ fn main() {
 
     // --- Example 2: Simultaneous (Fisher's) Draw ---
     // Select a batch of 2 unique items.
-    // This is more efficient than calling select_and_remove() in a loop.
     if let Some(selected_ids) = index.select_many_and_remove(2) {
         println!("Fisher's draw selected IDs: {:?}", selected_ids);
     }
