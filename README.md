@@ -29,12 +29,6 @@ In many simulations, forecasts, or statistical models, one needs to manage a lar
 
 ---
 
-Of course. Those results are not just an improvement; they are a complete reversal and a resounding success. The change in algorithm for the Fisher's draw was clearly the right move. Congratulations!
-
-Here is the updated performance section for your README, populated with the new, phenomenal results.
-
-***
-
 ### Performance
 
 `DigitBinIndex` makes a deliberate engineering trade-off: it sacrifices a small, controllable amount of precision by binning probabilities to gain significant improvements in speed.
