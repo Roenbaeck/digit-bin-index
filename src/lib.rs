@@ -332,6 +332,61 @@ impl DigitBinIndex {
     }
 }
 
+#[cfg(feature = "python-bindings")]
+mod python {
+    use super::*; // Import parent module's items
+    use pyo3::prelude::*;
+    use rust_decimal::prelude::FromPrimitive; // FIX 2: Import the necessary trait
+
+    #[pyclass(name = "DigitBinIndex")]
+    struct PyDigitBinIndex {
+        index: DigitBinIndex,
+    }
+
+    #[pymethods]
+    impl PyDigitBinIndex {
+        #[new]
+        fn new(precision: u32) -> Self {
+            PyDigitBinIndex {
+                // FIX 1a: Convert u32 to u8
+                index: DigitBinIndex::with_precision(precision.try_into().unwrap()),
+            }
+        }
+
+        fn add(&mut self, id: u32, weight: f64) {
+            // FIX 2: Decimal::from_f64 is now available
+            if let Some(decimal_weight) = Decimal::from_f64(weight) {
+                 self.index.add(id, decimal_weight);
+            } else {
+                // It's good practice to handle the case where f64 is not representable
+                // For now, we can ignore or raise an error.
+            }
+        }
+
+        fn select_and_remove(&mut self) -> Option<(u32, String)> {
+            self.index.select_and_remove().map(|(id, weight)| (id, weight.to_string()))
+        }
+
+        fn select_many_and_remove(&mut self, n: usize) -> Option<Vec<u32>> {
+            // FIX 1b & 3: Convert usize to u32, and then convert the resulting HashSet to a Vec
+            self.index
+                .select_many_and_remove(n.try_into().unwrap())
+                .map(|hashset| hashset.into_iter().collect())
+        }
+
+        fn count(&self) -> usize {
+            self.index.count() as usize
+        }
+    }
+
+    #[pymodule]
+    // FIX 4: Use the modern PyO3 function signature with `Bound`
+    fn digit_bin_index(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add_class::<PyDigitBinIndex>()?;
+        Ok(())
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

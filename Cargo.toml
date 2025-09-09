@@ -16,8 +16,22 @@ rust_decimal_macros = "1.37"
 rand = "0.8" # rust_decimal does not yet support rand 0.9
 roaring = "0.11"
 
+# PyO3 is now an optional dependency
+[dependencies.pyo3]
+version = "0.26.0"
+features = ["extension-module"]
+optional = true
+
+[features]
+# Define a feature called "python-bindings" that enables the pyo3 dependency
+python-bindings = ["pyo3"]
+
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
+
+[lib]
+name = "digit_bin_index"
+crate-type = ["lib", "cdylib"]
 
 [[bench]]
 name = "selection_benchmark"
