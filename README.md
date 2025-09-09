@@ -75,58 +75,79 @@ You should consider a more general-purpose data structure (like a Fenwick Tree) 
 
 ---
 
+### Choosing a Precision
+
+The `precision` parameter controls the depth of the radix tree and represents the core trade-off of the library: **Accuracy vs. Performance & Memory**. Choosing the right value is key to getting the most out of `DigitBinIndex`.
+
+#### The Rule of Thumb
+
+**For most applications, a precision of 3 or 4 is an excellent starting point.** This provides a great balance, capturing the vast majority of the weight distribution while remaining extremely fast.
+
+#### The Mathematical Intuition
+
+The impact of each decimal place on an item's probability diminishes exponentially. Consider a weight of `0.12345`:
+
+*   The 1st digit (`1`) contributes `0.1` to the value.
+*   The 2nd digit (`2`) contributes `0.02`.
+*   The 3rd digit (`3`) contributes `0.003`.
+*   The 4th digit (`4`) contributes only `0.0004`.
+
+By truncating at 3 digits, the maximum error for any single item is less than `0.001`. When sampling from a large population, these small, random errors tend to average out, having a negligible effect on the final distribution of selections. The first few digits capture almost all of the meaningful relative differences between item weights, which is what drives a weighted random draw.
+
+#### Guidance
+
+Here is a summary to help guide your choice:
+
+| Precision | Typical Use Case                                     | Trade-offs                                                                      |
+| :-------- | :--------------------------------------------------- | :------------------------------------------------------------------------------ |
+| **1-2**   | Maximum performance, minimal memory usage.           | Best for coarse-grained weights (e.g., `0.1`, `0.5`, `0.9`). Loses significant accuracy with finely-grained data. |
+| **3-4**   | **Recommended Default.** The optimal balance for most scenarios. | Captures sufficient detail for typical floating-point data from simulations or models, with negligible performance cost. |
+| **5+**    | High-fidelity scenarios where weights are very close. | Use if you must distinguish between weights like `0.12345` and `0.12346`. This increases memory usage and is slightly slower, but still `O(P)`. |
+
+---
+
 ### Usage
 
-First, add `digit-bin-index` and its dependencies to your `Cargo.toml`. The library uses the `rust_decimal` crate for high-performance, precise decimal arithmetic.
+First, add `digit-bin-index` to your project's dependencies in `Cargo.toml`. You will also need `rust_decimal` because it is used in the public API for defining item weights.
 
 ```toml
 [dependencies]
-digit-bin-index = "0.2.1" # Use the latest version
-rust_decimal = { version = "1.32", features = ["rand"] }
-roaring = "0.10"
-rand = "0.8"
+digit-bin-index = "0.2.1"    # Use the latest version from crates.io
+rust_decimal = "1.37"        # The decimal type used in the API
+rust_decimal_macros = "1.37" # Recommended for easily creating decimals
 ```
 
 Then, you can use `DigitBinIndex` in your project to perform both sequential (Wallenius') and simultaneous (Fisher's) draws.
 
 ```rust
 use digit_bin_index::DigitBinIndex;
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec; // For easy decimal creation
+use rust_decimal_macros::dec; // A convenient macro, dec!
 
 fn main() {
-    // Create an index with a precision of 3 decimal places.
+    // Create a new index with a precision of 3 decimal places.
     let mut index = DigitBinIndex::with_precision(3);
 
-    // Add individuals with unique IDs and associated weights.
-    // The `dec!` macro is a convenient way to create decimals.
-    index.add(101, dec!(0.543));
-    index.add(102, dec!(0.120));
-    index.add(103, dec!(0.543)); // A duplicate weight is fine.
-    index.add(104, dec!(0.810));
-    index.add(105, dec!(0.12345)); // Note: this will be binned as 0.123
+    // Add individuals with their ID and a specific weight.
+    index.add(101, dec!(0.123)); // Low weight
+    index.add(202, dec!(0.800)); // High weight
+    index.add(303, dec!(0.755)); // High weight
+    index.add(404, dec!(0.110)); // Low weight
 
-    println!(
-        "Initial state: {} individuals, total weight = {}",
-        index.count(),
-        index.total_weight()
-    );
+    // --- Example 1: Sequential (Wallenius') Draw ---
+    // Select one item, which is removed from the pool for subsequent draws.
+    // The higher weighted items (202, 303) are more likely to be chosen.
+    if let Some((selected_id, approx_weight)) = index.select_and_remove() {
+        println!("Wallenius draw selected: ID {}, Weight ~{}", selected_id, approx_weight);
+    }
+    println!("Items remaining: {}", index.count()); // Will be 3
 
-    // --- 1. Wallenius' Draw (Sequential) ---
-    // Select one item, which is immediately removed. The odds change for the next draw.
-    if let Some((id, _)) = index.select_and_remove() {
-        println!("\nSelected one individual (Wallenius' draw): {}", id);
-        println!("State after one draw: {} individuals", index.count());
+    // --- Example 2: Simultaneous (Fisher's) Draw ---
+    // Select a batch of 2 unique items.
+    // This is more efficient than calling select_and_remove() in a loop.
+    if let Some(selected_ids) = index.select_many_and_remove(2) {
+        println!("Fisher's draw selected IDs: {:?}", selected_ids);
     }
-    
-    // --- 2. Fisher's Draw (Simultaneous) ---
-    // Select a batch of 2 unique individuals from the remaining population.
-    // This is a single, atomic operation.
-    if let Some(ids) = index.select_many_and_remove(2) {
-        println!("\nSelected two individuals (Fisher's draw): {:?}", ids);
-    }
-    
-    println!("\nFinal state: {} individuals", index.count());
+    println!("Items remaining: {}", index.count()); // Will be 1
 }
 ```
 
