@@ -449,12 +449,8 @@ mod tests {
             println!("Selected ID: {} with weight: {}", id, weight);
         }
         println!("Intermediate state: {} individuals, total weight = {}", index.count(), index.total_weight()); 
-        if let Some((id, weight)) = index.select_and_remove() {
-            println!("Selected ID: {} with weight: {}", id, weight);
-        }
-        println!("Intermediate state: {} individuals, total weight = {}", index.count(), index.total_weight()); 
-        if let Some((id, weight)) = index.select_and_remove() {
-            println!("Selected ID: {} with weight: {}", id, weight);
+        if let Some(selection) = index.select_many_and_remove(2) {
+            println!("Selection: {:?}", selection);
         }
         println!("Final state: {} individuals, total weight = {}", index.count(), index.total_weight()); 
     }
