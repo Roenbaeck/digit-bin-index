@@ -605,7 +605,7 @@ impl DigitBinIndex {
 
 #[cfg(feature = "python-bindings")]
 mod python {
-    use super::*; // Import parent module's items
+    use super::*;
     use pyo3::prelude::*;
     use rust_decimal::prelude::FromPrimitive;
 
@@ -625,7 +625,7 @@ mod python {
 
         fn add(&mut self, id: u32, weight: f64) -> bool {
             if let Some(decimal_weight) = Decimal::from_f64(weight) {
-                 self.index.add(id, decimal_weight)
+                self.index.add(id, decimal_weight)
             } else {
                 false
             }
@@ -642,7 +642,6 @@ mod python {
         }
 
         fn select_many(&self, n: u32) -> Option<Vec<(u32, String)>> {
-            // This code becomes slightly simpler now. No need to name the variable `set`.
             self.index.select_many(n).map(|items| {
                 items.into_iter().map(|(id, w)| (id, w.to_string())).collect()
             })
@@ -668,12 +667,11 @@ mod python {
     }
 
     #[pymodule]
-    fn digit_bin_index(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+    fn digit_bin_index(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PyDigitBinIndex>()?;
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests {
