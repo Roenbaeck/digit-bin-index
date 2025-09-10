@@ -8,9 +8,9 @@
 //! noncentral hypergeometric distribution.
 
 use rust_decimal::Decimal;
-use rand::Rng; 
+use rand::Rng;
 use roaring::RoaringBitmap;
-use std::collections::HashSet; 
+use std::collections::HashSet;
 use std::vec;
 
 // The default precision to use if none is specified in the constructor.
@@ -33,7 +33,7 @@ pub struct Node {
     /// The total sum of probabilities stored under this node.
     pub accumulated_value: Decimal,
     /// The total count of individuals stored under this node.
-    pub content_count: u32, 
+    pub content_count: u32,
 }
 
 impl Node {
@@ -57,7 +57,7 @@ impl Node {
 /// is the configured precision. This is significantly faster than the O(log N)
 /// performance of general-purpose structures like a Fenwick Tree for its
 /// ideal use case.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DigitBinIndex {
     /// The root node of the tree.
     pub root: Node,
@@ -120,11 +120,24 @@ impl DigitBinIndex {
         digit as usize
     }
 
+    // --- Standard Functions ---
+
     /// Adds an individual with a specific weight (probability) to the index.
-    ///
-    /// The operation's time complexity is O(P), where P is the configured precision.
-    pub fn add(&mut self, individual_id: u32, weight: Decimal) {
+    pub fn add(&mut self, individual_id: u32, mut weight: Decimal) -> bool {
+        // Guard against adding non-positive weights, which are invalid for this structure.
+        if weight <= Decimal::ZERO {
+            return false;
+        }
+
+        weight.rescale(self.precision as u32);
+
+        // After rescaling, a very small positive weight might become zero.
+        if weight.is_zero() {
+            return false;
+        }
+
         Self::add_recurse(&mut self.root, individual_id, weight, 1, self.precision);
+        true
     }
 
     /// Recursive private method to handle adding individuals.
@@ -139,13 +152,12 @@ impl DigitBinIndex {
         node.accumulated_value += weight;
 
         if current_depth > max_depth {
-            match &mut node.content {
-                NodeContent::Leaf(bitmap) => { bitmap.insert(individual_id); },
-                NodeContent::Internal(children) => {
-                    if children.is_empty() {
-                        node.content = NodeContent::Leaf(RoaringBitmap::from_iter([individual_id]));
-                    } else { panic!("Cannot add individual to a non-empty internal node at leaf depth."); }
-                }
+            if let NodeContent::Internal(_) = &node.content {
+                 // First time adding to this path, convert to Leaf
+                node.content = NodeContent::Leaf(RoaringBitmap::new());
+            }
+            if let NodeContent::Leaf(bitmap) = &mut node.content {
+                bitmap.insert(individual_id);
             }
             return;
         }
@@ -156,168 +168,185 @@ impl DigitBinIndex {
                 children.resize_with(digit + 1, Node::new_internal);
             }
             Self::add_recurse(&mut children[digit], individual_id, weight, current_depth + 1, max_depth);
-        } else {
-            panic!("Attempted to traverse deeper on what should be a leaf node.");
         }
     }
 
-    /// Performs a weighted random selection, removes the item, and returns its ID and an
-    /// approximation of its original weight.
-    ///
-    /// This operation is the core of a Wallenius' noncentral hypergeometric distribution
-    /// draw. The time complexity is O(P), where P is the configured precision.
-    /// Returns `None` if the index is empty.
-    pub fn select_and_remove(&mut self) -> Option<(u32, Decimal)> {
+    /// Removes an individual with a specific weight (probability) from the index.
+    pub fn remove(&mut self, individual_id: u32, mut weight: Decimal) {
+        weight.rescale(self.precision as u32);
+        Self::remove_recurse(&mut self.root, individual_id, weight, 1, self.precision);
+    }
+
+    /// Recursive private method to handle removing individuals.
+    fn remove_recurse(
+        node: &mut Node,
+        individual_id: u32,
+        weight: Decimal,
+        current_depth: u8,
+        max_depth: u8,
+    ) -> bool {
+        if current_depth > max_depth {
+            if let NodeContent::Leaf(bitmap) = &mut node.content {
+                if bitmap.remove(individual_id) {
+                    node.content_count -= 1;
+                    node.accumulated_value -= weight;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        let digit = Self::get_digit_at(weight, current_depth);
+        if let NodeContent::Internal(children) = &mut node.content {
+            if children.len() > digit && Self::remove_recurse(&mut children[digit], individual_id, weight, current_depth + 1, max_depth) {
+                node.content_count -= 1;
+                node.accumulated_value -= weight;
+                return true;
+            }
+        }
+        false
+    }
+
+
+    // --- Selection Functions ---
+
+    /// Performs random selection of one individual.
+    pub fn select(&self) -> Option<(u32, Decimal)> {
         if self.root.content_count == 0 {
             return None;
         }
-        
+
         let mut rng = rand::thread_rng();
         let random_target = rng.gen_range(Decimal::ZERO..self.root.accumulated_value);
-        
-        let (selected_id, weight, path) = Self::select_recurse(&mut self.root, random_target, vec![]);
-        self.update_values_post_removal(&path, weight);
-        Some((selected_id, weight))
+
+        self.select_recurse(&self.root, random_target, Decimal::ZERO, 1)
     }
 
-    /// Performs a simultaneous weighted random selection of `k` unique items (Fisher's model).
-    ///
-    /// This uses an optimized "bin-aware rejection sampling" algorithm that is significantly
-    /// faster than naive rejection sampling. The process is:
-    /// 1. A selection phase where `k` unique individuals are chosen from the unaltered index.
-    /// 2. An update phase where all chosen individuals are removed from the index.
-    ///
-    /// Returns `None` if `num_to_draw` is greater than the total number of items.
-    pub fn select_many_and_remove(&mut self, num_to_draw: u32) -> Option<HashSet<u32>> {
-        if num_to_draw > self.count() { return None; }
-        if num_to_draw == 0 { return Some(HashSet::new()); }
-
-        let mut selected_items = Vec::with_capacity(num_to_draw as usize);
-        let mut selected_ids = HashSet::with_capacity(num_to_draw as usize);
-        let mut rng = rand::thread_rng();
-
-        // --- Phase 1: Selection via Simple Rejection Sampling ---
-        // We sample from the original, unaltered tree until we find num_to_draw unique items.
-        while selected_ids.len() < num_to_draw as usize {
-            // We can reuse the core recursive find logic, but we don't need to pass the selected_ids down.
-            // Let's create a simplified find helper for this.
-            let random_target = rng.gen_range(Decimal::ZERO..self.root.accumulated_value);
-            if let Some((id, weight, path)) = self.find_candidate_recurse(&self.root, random_target, vec![]) {
-                if selected_ids.insert(id) {
-                    // It's a new, unique item. Store its full info for the update phase.
-                    selected_items.push((path, id, weight));
-                }
-            } else {
-                // This should not happen in a non-empty tree.
-                return None; 
-            }
-        }
-
-        // --- Phase 2: Batched Update ---
-        // Now that we have all our unique items, update the tree in one go.
-        for (path, id, weight) in selected_items {
-            // This is your original update function. It will handle the content_count and accumulated_value.
-            // It does NOT need to touch available_count.
-            Self::update_and_remove_recurse(&mut self.root, &path, id, weight);
-        }
-        
-        Some(selected_ids)
-    }
-
-    /// A simplified recursive find that does not check for uniqueness.
-    /// It's used by the rejection sampling method.
-    fn find_candidate_recurse(&self, node: &Node, mut target: Decimal, mut path: Vec<usize>) -> Option<(u32, Decimal, Vec<usize>)> {
-        match &node.content {
-            NodeContent::Leaf(bitmap) => {
+    /// Recursive helper for the select function.
+    fn select_recurse(&self, node: &Node, mut target: Decimal, weight: Decimal, current_depth: u8) -> Option<(u32, Decimal)> {
+        if current_depth > self.precision {
+             if let NodeContent::Leaf(bitmap) = &node.content {
                 if bitmap.is_empty() { return None; }
                 let mut rng = rand::thread_rng();
-                // In a simple leaf, any member is a valid candidate.
+                // Select a random Nth element from the bitmap iterator
                 let rand_index = rng.gen_range(0..bitmap.len() as u32);
                 let selected_id = bitmap.select(rand_index).unwrap();
-
-                let weight = node.accumulated_value / Decimal::from(node.content_count);
-                Some((selected_id, weight, path))
+                // The accumulated weight is the correct binned weight for this leaf
+                return Some((selected_id, weight));
             }
-            NodeContent::Internal(children) => {
-                for (i, child) in children.iter().enumerate() {
-                    if child.accumulated_value.is_zero() { continue; }
-                    if target < child.accumulated_value {
-                        path.push(i);
-                        return self.find_candidate_recurse(child, target, path);
-                    }
-                    target -= child.accumulated_value;
+        }
+
+        if let NodeContent::Internal(children) = &node.content {
+            for (i, child) in children.iter().enumerate() {
+                if child.accumulated_value.is_zero() { continue; }
+                if target < child.accumulated_value {
+                    // CORRECTED LOGIC: Add the digit value at the current decimal place.
+                    let new_weight = weight + Decimal::new(i as i64, current_depth as u32);
+                    return self.select_recurse(child, target, new_weight, current_depth + 1);
                 }
-                None // Should not be reached if total weight is consistent
+                target -= child.accumulated_value;
             }
         }
-    }
-
-    /// Recursive helper to correctly update the tree and remove an item from a leaf.
-    fn update_and_remove_recurse(node: &mut Node, path: &[usize], id_to_remove: u32, weight: Decimal) {
-        node.content_count -= 1;
-        node.accumulated_value -= weight;
-        
-        let Some(&index) = path.first() else {
-            if let NodeContent::Leaf(bitmap) = &mut node.content {
-                // --- ROARING CHANGE: Remove from the bitmap ---
-                bitmap.remove(id_to_remove);
-            }
-            return;
-        };
-
-        if let NodeContent::Internal(children) = &mut node.content {
-            if let Some(child) = children.get_mut(index) {
-                // The recursive call is now to the static method itself.
-                Self::update_and_remove_recurse(child, &path[1..], id_to_remove, weight);
-            }
-        }
-    }
-
-    /// Recursive helper to find the individual and record the traversal path.
-    fn select_recurse(
-        node: &mut Node,
-        mut target: Decimal,
-        mut path: Vec<usize>,
-    ) -> (u32, Decimal, Vec<usize>) {
-        match &mut node.content {
-            NodeContent::Leaf(bitmap) => {
-                let mut rng = rand::thread_rng();
-                // --- ROARING CHANGE: Select a random Nth element from the bitmap iterator ---
-                let bitmap_len = bitmap.len() as u32;
-                let rand_index = rng.gen_range(0..bitmap_len);
-                let selected_id = bitmap.select(rand_index).unwrap(); // Get the Nth item.
-
-                let weight = node.accumulated_value / Decimal::from(node.content_count);
-                (selected_id, weight, path)
-            }
-            NodeContent::Internal(children) => {
-                for (i, child) in children.iter_mut().enumerate() {
-                    if child.accumulated_value.is_zero() { continue; }
-                    if target < child.accumulated_value {
-                        path.push(i);
-                        return Self::select_recurse(child, target, path);
-                    }
-                    target -= child.accumulated_value;
-                }
-                panic!("Selection logic failed: target exceeded total value of children.");
-            }
-        }
+        None // Should not be reached in a consistent tree
     }
     
-    /// After an individual is removed, this updates counts up the tree.
-    fn update_values_post_removal(&mut self, path: &[usize], weight: Decimal) {
-        let mut current_node = &mut self.root;
-        current_node.content_count -= 1;
-        current_node.accumulated_value -= weight;
 
-        for &index in path {
-            if let NodeContent::Internal(children) = &mut current_node.content {
-                current_node = &mut children[index];
-                current_node.content_count -= 1;
-                current_node.accumulated_value -= weight;
-            } else {
-                return;
+    /// Private helper for finding a unique item using bin-aware rejection sampling.
+    /// It performs one weighted traversal and returns a unique item, or None if the
+    /// chosen bin is already exhausted.
+    fn select_unique(&self, selected_ids: &RoaringBitmap) -> Option<(u32, Decimal)> {
+        if self.root.content_count == 0 {
+            return None;
+        }
+        let mut rng = rand::thread_rng();
+        let random_target = rng.gen_range(Decimal::ZERO..self.root.accumulated_value);
+
+        // Call the new recursive helper that is aware of already selected IDs
+        self.select_unique_recurse(&self.root, random_target, Decimal::ZERO, 1, selected_ids)
+    }
+
+    /// NEW recursive helper for the unique selection process.
+    fn select_unique_recurse(
+        &self,
+        node: &Node,
+        mut target: Decimal,
+        weight: Decimal,
+        current_depth: u8,
+        selected_ids: &RoaringBitmap,
+    ) -> Option<(u32, Decimal)> {
+        // Base Case: We've reached a leaf bin.
+        if current_depth > self.precision {
+            if let NodeContent::Leaf(bitmap) = &node.content {
+                // Find all individuals in this bin who have NOT already been selected.
+                let available_ids = bitmap - selected_ids;
+                if available_ids.is_empty() {
+                    // This bin is exhausted for this batch. Trigger a rejection by returning None.
+                    return None;
+                }
+
+                // Select any individual from the available set.
+                let selected_id = available_ids.min().unwrap();
+                
+                // The weight was constructed on the way down.
+                return Some((selected_id, weight));
             }
+        }
+
+        // Recursive Step: Traverse internal nodes.
+        if let NodeContent::Internal(children) = &node.content {
+            for (i, child) in children.iter().enumerate() {
+                if child.accumulated_value.is_zero() { continue; }
+                if target < child.accumulated_value {
+                    let new_weight = weight + Decimal::new(i as i64, current_depth as u32);
+                    // Propagate the result (or the rejection) upwards.
+                    return self.select_unique_recurse(child, target, new_weight, current_depth + 1, selected_ids);
+                }
+                target -= child.accumulated_value;
+            }
+        }
+        None // Should not be reached in a consistent tree
+    }    
+
+    /// Selects multiple unique individuals.
+    pub fn select_many(&self, num_to_draw: u32) -> Option<HashSet<(u32, Decimal)>> {
+        if num_to_draw > self.count() {
+            return None;
+        }
+        if num_to_draw == 0 {
+            return Some(HashSet::new());
+        }
+
+        let mut selected = HashSet::with_capacity(num_to_draw as usize);
+        let mut selected_ids = RoaringBitmap::new();
+        while selected.len() < num_to_draw as usize {
+            if let Some((id, weight)) = self.select_unique(&selected_ids) {
+                if selected_ids.insert(id) {
+                    selected.insert((id, weight));
+                }
+            } 
+        }
+        Some(selected)
+    }
+
+    /// Selects and removes a single individual.
+    pub fn select_and_remove(&mut self) -> Option<(u32, Decimal)> {
+        if let Some((individual_id, weight)) = self.select() {
+            self.remove(individual_id, weight);
+            Some((individual_id, weight))
+        } else {
+            None
+        }
+    }
+
+    /// Selects and removes multiple unique individuals.
+    pub fn select_many_and_remove(&mut self, num_to_draw: u32) -> Option<HashSet<(u32, Decimal)>> {
+        if let Some(selected) = self.select_many(num_to_draw) {
+            for &(individual_id, weight) in &selected {
+                self.remove(individual_id, weight);
+            }
+            Some(selected)
+        } else {
+            None
         }
     }
 
@@ -336,7 +365,7 @@ impl DigitBinIndex {
 mod python {
     use super::*; // Import parent module's items
     use pyo3::prelude::*;
-    use rust_decimal::prelude::FromPrimitive; // FIX 2: Import the necessary trait
+    use rust_decimal::prelude::FromPrimitive;
 
     #[pyclass(name = "DigitBinIndex")]
     struct PyDigitBinIndex {
@@ -348,40 +377,55 @@ mod python {
         #[new]
         fn new(precision: u32) -> Self {
             PyDigitBinIndex {
-                // FIX 1a: Convert u32 to u8
                 index: DigitBinIndex::with_precision(precision.try_into().unwrap()),
             }
         }
 
-        fn add(&mut self, id: u32, weight: f64) {
-            // FIX 2: Decimal::from_f64 is now available
+        fn add(&mut self, id: u32, weight: f64) -> bool {
             if let Some(decimal_weight) = Decimal::from_f64(weight) {
-                 self.index.add(id, decimal_weight);
+                 self.index.add(id, decimal_weight)
             } else {
-                // It's good practice to handle the case where f64 is not representable
-                // For now, we can ignore or raise an error.
+                false
             }
+        }
+
+        fn remove(&mut self, id: u32, weight: f64) {
+            if let Some(decimal_weight) = Decimal::from_f64(weight) {
+                self.index.remove(id, decimal_weight);
+            }
+        }
+
+        fn select(&self) -> Option<(u32, String)> {
+            self.index.select().map(|(id, weight)| (id, weight.to_string()))
+        }
+
+        fn select_many(&self, n: u32) -> Option<Vec<(u32, String)>> {
+            self.index.select_many(n).map(|set| {
+                set.into_iter().map(|(id, w)| (id, w.to_string())).collect()
+            })
         }
 
         fn select_and_remove(&mut self) -> Option<(u32, String)> {
             self.index.select_and_remove().map(|(id, weight)| (id, weight.to_string()))
         }
 
-        fn select_many_and_remove(&mut self, n: usize) -> Option<Vec<u32>> {
-            // FIX 1b & 3: Convert usize to u32, and then convert the resulting HashSet to a Vec
-            self.index
-                .select_many_and_remove(n.try_into().unwrap())
-                .map(|hashset| hashset.into_iter().collect())
+        fn select_many_and_remove(&mut self, n: u32) -> Option<Vec<(u32, String)>> {
+            self.index.select_many_and_remove(n).map(|set| {
+                set.into_iter().map(|(id, w)| (id, w.to_string())).collect()
+            })
         }
 
-        fn count(&self) -> usize {
-            self.index.count() as usize
+        fn count(&self) -> u32 {
+            self.index.count()
+        }
+
+        fn total_weight(&self) -> String {
+            self.index.total_weight().to_string()
         }
     }
 
     #[pymodule]
-    // FIX 4: Use the modern PyO3 function signature with `Bound`
-    fn digit_bin_index(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    fn digit_bin_index(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
         m.add_class::<PyDigitBinIndex>()?;
         Ok(())
     }
@@ -392,6 +436,28 @@ mod python {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_select_and_remove() {
+        let mut index = DigitBinIndex::with_precision(3);
+        index.add(1, dec!(0.085));
+        index.add(2, dec!(0.205));
+        index.add(3, dec!(0.346));
+        index.add(4, dec!(0.364));
+        println!("Initial state: {} individuals, total weight = {}", index.count(), index.total_weight());    
+        if let Some((id, weight)) = index.select_and_remove() {
+            println!("Selected ID: {} with weight: {}", id, weight);
+        }
+        println!("Intermediate state: {} individuals, total weight = {}", index.count(), index.total_weight()); 
+        if let Some((id, weight)) = index.select_and_remove() {
+            println!("Selected ID: {} with weight: {}", id, weight);
+        }
+        println!("Intermediate state: {} individuals, total weight = {}", index.count(), index.total_weight()); 
+        if let Some((id, weight)) = index.select_and_remove() {
+            println!("Selected ID: {} with weight: {}", id, weight);
+        }
+        println!("Final state: {} individuals, total weight = {}", index.count(), index.total_weight()); 
+    }
 
     #[test]
     fn test_wallenius_distribution_is_correct() {
@@ -475,14 +541,14 @@ mod tests {
             
             // Call the new method
             if let Some(selected_ids) = index.select_many_and_remove(NUM_DRAWS) {
-                let high_risk_in_this_run = selected_ids.iter().filter(|&&id| id >= ITEMS_PER_GROUP).count();
+                let high_risk_in_this_run = selected_ids.iter().filter(|&&(id, _)| id >= ITEMS_PER_GROUP).count();
                 total_high_risk_selected += high_risk_in_this_run as u32;
             }
         }
         
         let avg_high_risk = total_high_risk_selected as f64 / NUM_SIMULATIONS as f64;
         let fishers_mean = NUM_DRAWS as f64 * (2.0 / 3.0);
-        let tolerance = fishers_mean * 0.10;
+        let tolerance = fishers_mean * 0.02;
 
         // The mean of a Fisher's draw should be very close to the naive expectation.
         assert!(

@@ -157,7 +157,7 @@ Add `digit-bin-index` to your project's `Cargo.toml`. You will also need `rust_d
 
 ```toml
 [dependencies]
-digit-bin-index = "0.2.2"    # Use the latest version from crates.io
+digit-bin-index = "0.2.3"    # Use the latest version from crates.io
 rust_decimal = "1.37"        # The decimal type used in the API
 rust_decimal_macros = "1.37" # Recommended for easily creating decimals
 ```
