@@ -33,7 +33,16 @@ criterion = { version = "0.7", features = ["html_reports"] }
 name = "digit_bin_index"
 crate-type = ["lib", "cdylib"]
 
+[profile.release]
+opt-level = 3
+lto = "fat"  # Link-time optimization: inlines across crates
+codegen-units = 1  # Better opts, slower compiles
+
 [[bench]]
 name = "selection_benchmark"
 harness = false
 
+[[test]]
+name = "benchmark_tests"
+path = "benches/selection_benchmark.rs"
+harness = true
