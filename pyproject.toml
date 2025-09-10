@@ -1,11 +1,13 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
 # The 'name' must be defined statically here.
 # It MUST match the 'name' in your Cargo.toml's [package] section.
 name = "digit-bin-index"
+
+requires-python = ">=3.8" # Matches abi3-py38 and classifiers
 
 # These fields are read from Cargo.toml by maturin, so we list them as dynamic.
 # The second error you saw lists exactly which fields are allowed to be dynamic.
@@ -16,6 +18,7 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

@@ -1,30 +1,28 @@
 [package]
 name = "digit-bin-index"
-version = "0.2.2" 
+version = "0.2.3"
 edition = "2021"
-authors = ["Lars Rönnbäck <lars.ronnback@anchormodeling.com>"] 
-license = "MIT" 
-description = "A high-performance, O(P) data structure for weighted random sampling of binned probabilities, ideal for large-scale simulations." 
-repository = "https://github.com/Roenbaeck/digit-bin-index" 
-readme = "README.md" 
-keywords = ["statistics", "probability", "weighted-sampling", "simulation", "data-structure"] 
-categories = ["data-structures", "algorithms", "science", "simulation"] 
+authors = ["Lars Rönnbäck <lars.ronnback@anchormodeling.com>"]
+license = "MIT"
+description = "A high-performance, O(P) data structure for weighted random sampling of binned probabilities, ideal for large-scale simulations."
+repository = "https://github.com/Roenbaeck/digit-bin-index"
+readme = "README.md"
+keywords = ["statistics", "probability", "weighted-sampling", "simulation", "data-structure"]
+categories = ["data-structures", "algorithms", "science", "simulation"]
 
 [dependencies]
 rust_decimal = { version = "1.37", features = ["rand"] }
 rust_decimal_macros = "1.37"
-rand = "0.8" # rust_decimal does not yet support rand 0.9
+rand = "0.8" # Compatible with rust_decimal
 roaring = "0.11"
 
-# PyO3 is now an optional dependency
 [dependencies.pyo3]
 version = "0.26.0"
-features = ["extension-module"]
+features = ["extension-module", "abi3-py38", "macros"] # Added abi3-py38 for broader Python compatibility
 optional = true
 
 [features]
-# Define a feature called "python-bindings" that enables the pyo3 dependency
-python-bindings = ["pyo3"]
+python-bindings = ["dep:pyo3"]
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
@@ -33,7 +31,16 @@ criterion = { version = "0.7", features = ["html_reports"] }
 name = "digit_bin_index"
 crate-type = ["lib", "cdylib"]
 
+[profile.release]
+opt-level = 3
+lto = "fat"  # Link-time optimization: inlines across crates
+codegen-units = 1  # Better optimizations, slower compiles
+
 [[bench]]
 name = "selection_benchmark"
 harness = false
 
+[[test]]
+name = "benchmark_tests"
+path = "benches/selection_benchmark.rs"
+harness = true
