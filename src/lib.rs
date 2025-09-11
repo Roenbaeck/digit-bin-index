@@ -516,13 +516,59 @@ impl DigitBinIndex {
     /// assert_eq!(index.count(), 0);
     /// ```
     pub fn select_and_remove(&mut self) -> Option<(u32, Decimal)> {
-        if let Some((individual_id, weight, digits)) = self.select_with_digits() {
-            self.remove_with_digits(individual_id, weight, digits);
-            Some((individual_id, weight))
-        } else {
-            None
+        if self.root.content_count == 0 {
+            return None;
         }
+        let mut rng = rand::thread_rng();
+        let random_target = rng.gen_range(Decimal::ZERO..self.root.accumulated_value);
+        Self::select_and_remove_recurse(&mut self.root, random_target, 1, self.precision, &mut rng)
     }
+
+    // Helper function
+    fn select_and_remove_recurse(
+        node: &mut Node,
+        mut target: Decimal,
+        current_depth: u8,
+        max_depth: u8,
+        rng: &mut ThreadRng,
+    ) -> Option<(u32, Decimal)> {
+        // Base case: Leaf node
+        if current_depth > max_depth {
+            if let NodeContent::Leaf(bitmap) = &mut node.content {
+                if bitmap.is_empty() {
+                    return None;
+                }
+                let rand_index = rng.gen_range(0..node.content_count);
+                if let Some(selected_id) = bitmap.select(rand_index) {
+                    let weight = node.accumulated_value / Decimal::from(node.content_count);
+                    bitmap.remove(selected_id);
+                    node.content_count -= 1;
+                    node.accumulated_value -= weight;
+                    return Some((selected_id, weight));
+                }
+            }
+            return None;
+        }
+
+        // Recursive case: Internal node
+        if let NodeContent::Internal(children) = &mut node.content {
+            for child in children.iter_mut() {
+                if child.accumulated_value.is_zero() {
+                    continue;
+                }
+                if target < child.accumulated_value {
+                    if let Some((selected_id, weight)) = Self::select_and_remove_recurse(child, target, current_depth + 1, max_depth, rng) {
+                        node.content_count -= 1;
+                        node.accumulated_value -= weight;
+                        return Some((selected_id, weight));
+                    }
+                    return None; // If recurse failed (e.g., empty after skip), but shouldn't happen
+                }
+                target -= child.accumulated_value;
+            }
+        }
+        None
+    }    
 
     /// Selects multiple unique items randomly and removes them from the index.
     ///
@@ -551,16 +597,125 @@ impl DigitBinIndex {
     /// assert_eq!(index.count(), 0);
     /// ```
     pub fn select_many_and_remove(&mut self, num_to_draw: u32) -> Option<Vec<(u32, Decimal)>> {
-        if let Some(selected) = self.select_many_with_digits(num_to_draw) {
-            // Iteration works the same for Vec as for HashSet
-            for &(individual_id, weight, digits) in &selected {
-                self.remove_with_digits(individual_id, weight, digits);
-            }
-            Some(selected.into_iter().map(|(id, weight, _)| (id, weight)).collect())
+        if num_to_draw > self.count() || num_to_draw == 0 {
+            return if num_to_draw == 0 { Some(Vec::new()) } else { None };
+        }
+        let mut rng = rand::thread_rng();
+        let mut selected = Vec::with_capacity(num_to_draw as usize);
+        let total_weight = self.root.accumulated_value;
+        // Pass precision explicitly to avoid needing self in the recursive function
+        Self::select_many_and_remove_recurse(
+            &mut self.root,
+            num_to_draw,
+            total_weight,
+            &mut selected,
+            &mut rng,
+            1,
+            self.precision,
+        );
+        if selected.len() == num_to_draw as usize {
+            Some(selected)
         } else {
-            None
+            None // Should not happen if logic is correct
         }
     }
+
+    /// Recursive helper for batch selection and removal.
+    /// - node: Current subtree root.
+    /// - m: Number to select from this subtree.
+    /// - subtree_total: Accumulated weight of this node.
+    /// - selected: Mutable vec to collect (id, weight) from leaves.
+    /// - rng: Mutable RNG.
+    /// - current_depth: Current digit level.
+    /// - precision: The precision of the DigitBinIndex (passed explicitly).
+    fn select_many_and_remove_recurse(
+        node: &mut Node,
+        m: u32,
+        subtree_total: Decimal,
+        selected: &mut Vec<(u32, Decimal)>,
+        rng: &mut ThreadRng,
+        current_depth: u8,
+        precision: u8,
+    ) {
+        if m == 0 {
+            return;
+        }
+        if current_depth > precision {
+            // Leaf: Pick m random unique IDs from bitmap.
+            if let NodeContent::Leaf(bitmap) = &mut node.content {
+                let bin_weight = if node.content_count > 0 {
+                    node.accumulated_value / Decimal::from(node.content_count)
+                } else {
+                    Decimal::ZERO
+                };
+                let mut picked = 0;
+                while picked < m && !bitmap.is_empty() {
+                    let rand_index = rng.gen_range(0..bitmap.len() as u32);
+                    if let Some(id) = bitmap.select(rand_index) {
+                        bitmap.remove(id);
+                        selected.push((id, bin_weight));
+                        picked += 1;
+                    }
+                }
+                // Update node
+                node.content_count -= picked;
+                node.accumulated_value -= bin_weight * Decimal::from(picked);
+            }
+            return;
+        }
+
+        // Internal node: Assign m selections to children with rejection.
+        if let NodeContent::Internal(children) = &mut node.content {
+            // Prepare per-child data: assigned counts and lists of relative targets for reuse.
+            let mut child_assigned = vec![0u32; children.len()];
+            let mut child_rel_targets: Vec<Vec<Decimal>> = vec![Vec::new(); children.len()];
+
+            let mut assigned = 0u32;
+            while assigned < m {
+                let target = rng.gen_range(Decimal::ZERO..subtree_total);
+                let mut cum = Decimal::ZERO;
+                let mut chosen_child = None;
+                for (i, child) in children.iter().enumerate() {
+                    if target < cum + child.accumulated_value {
+                        if child_assigned[i] + 1 <= child.content_count {
+                            chosen_child = Some(i);
+                        }
+                        break;
+                    }
+                    cum += child.accumulated_value;
+                }
+                if let Some(idx) = chosen_child {
+                    child_assigned[idx] += 1;
+                    // Compute relative target for reuse in sub-level: target - cum_before_this_child
+                    let rel_target = target - (cum - children[idx].accumulated_value);
+                    child_rel_targets[idx].push(rel_target);
+                    assigned += 1;
+                }
+                // Else: reject (redraw loop continues)
+            }
+
+            // Recurse into each child with assigned > 0, passing precision
+            for (i, child) in children.iter_mut().enumerate() {
+                let child_m = child_assigned[i];
+                if child_m > 0 {
+                    Self::select_many_and_remove_recurse(
+                        child,
+                        child_m,
+                        child.accumulated_value,
+                        selected,
+                        rng,
+                        current_depth + 1,
+                        precision,
+                    );
+                }
+            }
+
+            // On unwind: Update this node's counts and values based on what was removed below
+            node.content_count = children.iter().map(|c| c.content_count).sum();
+            node.accumulated_value = children.iter().map(|c| c.accumulated_value).sum();
+        }
+    }
+
 
     /// Returns the total number of items currently in the index.
     ///
