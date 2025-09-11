@@ -171,6 +171,11 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
             (dbi, INITIAL_POP as u32)
         }, |(mut dbi, mut next_id)| {
             for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove()); }
+            let mut rng = rand::thread_rng();
+            for _ in 0..ACQUISITION_COUNT {
+                dbi.add(next_id, rng.gen_range(0.0001..0.9999));
+                next_id += 1;
+            }
         }, criterion::BatchSize::SmallInput);
     });
 
@@ -182,6 +187,11 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
             (selector, INITIAL_POP as u32)
         }, |(mut selector, mut next_id)| {
             for _ in 0..CHURN_COUNT { black_box(selector.select_and_remove()); }
+            let mut rng = rand::thread_rng();
+            for _ in 0..ACQUISITION_COUNT {
+                selector.add(next_id, rng.gen_range(0.0001..0.9999)).unwrap();
+                next_id += 1;
+            }
         }, criterion::BatchSize::SmallInput);
     });
     group.finish();
