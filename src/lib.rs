@@ -323,141 +323,8 @@ impl DigitBinIndex {
     ///     assert_eq!(weight, dec!(0.500));
     /// }
     /// ```
-    pub fn select(&self) -> Option<(u32, Decimal)> {
-        if let Some((id, weight, _)) = self.select_with_digits() {
-            return Some((id, weight))
-        }
-        None
-    }
-
-    // Helper function
-    fn select_with_digits(&self) -> Option<(u32, Decimal, [u8; MAX_PRECISION])> {
-        if self.root.content_count == 0 {
-            return None;
-        }
-        let mut rng = rand::thread_rng();
-        let random_target = rng.gen_range(Decimal::ZERO..self.root.accumulated_value);
-        let mut digits = [0u8; MAX_PRECISION];
-        self.select_recurse(&self.root, random_target, &mut digits, 1)
-    }
-
-    /// Recursive helper for the select function.
-    fn select_recurse(
-        &self,
-        node: &Node,
-        mut target: Decimal,
-        digits: &mut [u8; MAX_PRECISION], // Accumulate digits during traversal
-        current_depth: u8,
-    ) -> Option<(u32, Decimal, [u8; MAX_PRECISION])> {
-        if current_depth > self.precision {
-            if let NodeContent::Leaf(bitmap) = &node.content {
-                if bitmap.is_empty() {
-                    return None;
-                }
-                let mut rng = rand::thread_rng();
-                let rand_index = rng.gen_range(0..bitmap.len() as u32);
-                let selected_id = bitmap.select(rand_index).unwrap();
-                let weight = node.accumulated_value / Decimal::from(node.content_count);
-                return Some((selected_id, weight, digits.clone()));
-            }
-        }
-
-        if let NodeContent::Internal(children) = &node.content {
-            for (i, child) in children.iter().enumerate() {
-                if child.accumulated_value.is_zero() {
-                    continue;
-                }
-                if target < child.accumulated_value {
-                    digits[current_depth as usize - 1] = i as u8;
-                    return self.select_recurse(child, target, digits, current_depth + 1);
-                }
-                target -= child.accumulated_value;
-            }
-        }
-        None
-    }
-    
-
-    /// Private helper for finding a unique item using bin-aware rejection sampling.
-    /// It performs one weighted traversal and returns a unique item, or None if the
-    /// chosen bin is already exhausted.
-    fn select_unique(&self, selected_ids: &RoaringBitmap) -> Option<(u32, Decimal, [u8; MAX_PRECISION])> {
-        if self.root.content_count == 0 {
-            return None;
-        }
-        let mut rng = rand::thread_rng();
-        let random_target = rng.gen_range(Decimal::ZERO..self.root.accumulated_value);
-        let mut digits = [0u8; MAX_PRECISION];
-        self.select_unique_recurse(&self.root, random_target, &mut digits, 1, selected_ids, &mut rng)
-    }
-
-    /// NEW recursive helper for the unique selection process.
-    fn select_unique_recurse(
-        &self,
-        node: &Node,
-        mut target: Decimal,
-        digits: &mut [u8; MAX_PRECISION],
-        current_depth: u8,
-        selected_ids: &RoaringBitmap,
-        rng: &mut ThreadRng,
-    ) -> Option<(u32, Decimal, [u8; MAX_PRECISION])> {
-        // Base Case: We've reached a leaf bin.
-        if current_depth > self.precision {
-            if let NodeContent::Leaf(bitmap) = &node.content {
-                let total_in_bin = bitmap.len() as u32;
-                if total_in_bin == 0 { return None; }
-                let mut attempts = 0;
-                while attempts < total_in_bin {  // Bound loops to avoid infinite
-                    let rand_index = rng.gen_range(0..total_in_bin);
-                    if let Some(candidate_id) = bitmap.select(rand_index) {
-                        if !selected_ids.contains(candidate_id) {
-                            let weight = node.accumulated_value / Decimal::from(node.content_count);
-                            return Some((candidate_id, weight, digits.clone()));
-                        }
-                    }
-                    attempts += 1;
-                }
-                return None;  // Bin exhausted
-            }
-        }
-
-        // Recursive Step: Traverse internal nodes.
-        if let NodeContent::Internal(children) = &node.content {
-            for (i, child) in children.iter().enumerate() {
-                if child.accumulated_value.is_zero() { continue; }
-                if target < child.accumulated_value {
-                    digits[current_depth as usize - 1] = i as u8;                    
-                    return self.select_unique_recurse(child, target, digits, current_depth + 1, selected_ids, rng);
-                }
-                target -= child.accumulated_value;
-            }
-        }
-        None // Should not be reached in a consistent tree
-    }    
-
-    // Internal helper
-    fn select_many_with_digits(&self, num_to_draw: u32) -> Option<Vec<(u32, Decimal, [u8; MAX_PRECISION])>> {
-        if num_to_draw > self.count() {
-            return None;
-        }
-        if num_to_draw == 0 {
-            return Some(Vec::new());
-        }
-
-        // CHANGED: Use a Vec for storage
-        let mut selected = Vec::with_capacity(num_to_draw as usize);
-        let mut selected_ids = RoaringBitmap::new();
-        
-        while selected.len() < num_to_draw as usize {
-            // Rejection sampling loop
-            if let Some((id, weight, digits)) = self.select_unique(&selected_ids) {
-                if selected_ids.insert(id) {
-                    // CHANGED: Use .push() which is more efficient
-                    selected.push((id, weight, digits));
-                }
-            }
-        }
-        Some(selected)
+    pub fn select(&mut self) -> Option<(u32, Decimal)> {
+        self.select_and_optionally_remove(false)
     }
 
     /// Selects multiple unique items randomly based on weights without removal.
@@ -486,12 +353,8 @@ impl DigitBinIndex {
     ///     assert_eq!(selected.len(), 2);
     /// }
     /// ```
-    pub fn select_many(&self, num_to_draw: u32) -> Option<Vec<(u32, Decimal)>> {
-        let mut selected_without_digits = Vec::with_capacity(num_to_draw as usize);
-        if let Some(selected) = self.select_many_with_digits(num_to_draw) {
-            selected_without_digits = selected.into_iter().map(|(id, weight, _)| (id, weight)).collect();            
-        }
-        Some(selected_without_digits)
+    pub fn select_many(&mut self, num_to_draw: u32) -> Option<Vec<(u32, Decimal)>> {
+        self.select_many_and_optionally_remove(num_to_draw, false)
     }
 
     /// Selects a single item randomly and removes it from the index.
@@ -516,21 +379,27 @@ impl DigitBinIndex {
     /// assert_eq!(index.count(), 0);
     /// ```
     pub fn select_and_remove(&mut self) -> Option<(u32, Decimal)> {
+        self.select_and_optionally_remove(true)
+    }
+
+    // Wrapper function to handle both select and select_and_remove
+    pub fn select_and_optionally_remove(&mut self, with_removal: bool) -> Option<(u32, Decimal)> {
         if self.root.content_count == 0 {
             return None;
         }
         let mut rng = rand::thread_rng();
         let random_target = rng.gen_range(Decimal::ZERO..self.root.accumulated_value);
-        Self::select_and_remove_recurse(&mut self.root, random_target, 1, self.precision, &mut rng)
+        Self::select_and_optionally_remove_recurse(&mut self.root, random_target, 1, self.precision, &mut rng, with_removal)
     }
 
     // Helper function
-    fn select_and_remove_recurse(
+    fn select_and_optionally_remove_recurse(
         node: &mut Node,
         mut target: Decimal,
         current_depth: u8,
         max_depth: u8,
         rng: &mut ThreadRng,
+        with_removal: bool,
     ) -> Option<(u32, Decimal)> {
         // Base case: Leaf node
         if current_depth > max_depth {
@@ -541,9 +410,11 @@ impl DigitBinIndex {
                 let rand_index = rng.gen_range(0..node.content_count);
                 if let Some(selected_id) = bitmap.select(rand_index) {
                     let weight = node.accumulated_value / Decimal::from(node.content_count);
-                    bitmap.remove(selected_id);
-                    node.content_count -= 1;
-                    node.accumulated_value -= weight;
+                    if with_removal {
+                        bitmap.remove(selected_id);
+                        node.content_count -= 1;
+                        node.accumulated_value -= weight;
+                    }
                     return Some((selected_id, weight));
                 }
             }
@@ -557,9 +428,18 @@ impl DigitBinIndex {
                     continue;
                 }
                 if target < child.accumulated_value {
-                    if let Some((selected_id, weight)) = Self::select_and_remove_recurse(child, target, current_depth + 1, max_depth, rng) {
-                        node.content_count -= 1;
-                        node.accumulated_value -= weight;
+                    if let Some((selected_id, weight)) = Self::select_and_optionally_remove_recurse(
+                        child,
+                        target,
+                        current_depth + 1,
+                        max_depth,
+                        rng,
+                        with_removal,
+                    ) {
+                        if with_removal {
+                            node.content_count -= 1;
+                            node.accumulated_value -= weight;
+                        }
                         return Some((selected_id, weight));
                     }
                     return None; // If recurse failed (e.g., empty after skip), but shouldn't happen
@@ -568,7 +448,7 @@ impl DigitBinIndex {
             }
         }
         None
-    }    
+    } 
 
     /// Selects multiple unique items randomly and removes them from the index.
     ///
@@ -597,6 +477,11 @@ impl DigitBinIndex {
     /// assert_eq!(index.count(), 0);
     /// ```
     pub fn select_many_and_remove(&mut self, num_to_draw: u32) -> Option<Vec<(u32, Decimal)>> {
+        self.select_many_and_optionally_remove(num_to_draw, true)
+    }
+
+    // Wrapper function to handle both select_many and select_many_and_remove
+    pub fn select_many_and_optionally_remove(&mut self, num_to_draw: u32, with_removal: bool) -> Option<Vec<(u32, Decimal)>> {
         if num_to_draw > self.count() || num_to_draw == 0 {
             return if num_to_draw == 0 { Some(Vec::new()) } else { None };
         }
@@ -604,7 +489,7 @@ impl DigitBinIndex {
         let mut selected = Vec::with_capacity(num_to_draw as usize);
         let total_weight = self.root.accumulated_value;
         // Pass precision explicitly to avoid needing self in the recursive function
-        Self::select_many_and_remove_recurse(
+        Self::select_many_and_optionally_remove_recurse(
             &mut self.root,
             num_to_draw,
             total_weight,
@@ -612,6 +497,7 @@ impl DigitBinIndex {
             &mut rng,
             1,
             self.precision,
+            with_removal,
         );
         if selected.len() == num_to_draw as usize {
             Some(selected)
@@ -628,7 +514,7 @@ impl DigitBinIndex {
     /// - rng: Mutable RNG.
     /// - current_depth: Current digit level.
     /// - precision: The precision of the DigitBinIndex (passed explicitly).
-    fn select_many_and_remove_recurse(
+    fn select_many_and_optionally_remove_recurse(
         node: &mut Node,
         m: u32,
         subtree_total: Decimal,
@@ -636,6 +522,7 @@ impl DigitBinIndex {
         rng: &mut ThreadRng,
         current_depth: u8,
         precision: u8,
+        with_removal: bool,
     ) {
         if m == 0 {
             return;
@@ -652,14 +539,18 @@ impl DigitBinIndex {
                 while picked < m && !bitmap.is_empty() {
                     let rand_index = rng.gen_range(0..bitmap.len() as u32);
                     if let Some(id) = bitmap.select(rand_index) {
-                        bitmap.remove(id);
+                        if with_removal {
+                            bitmap.remove(id);
+                        }
                         selected.push((id, bin_weight));
                         picked += 1;
                     }
                 }
-                // Update node
-                node.content_count -= picked;
-                node.accumulated_value -= bin_weight * Decimal::from(picked);
+                if with_removal {
+                    // Update node
+                    node.content_count -= picked;
+                    node.accumulated_value -= bin_weight * Decimal::from(picked);
+                }
             }
             return;
         }
@@ -698,7 +589,7 @@ impl DigitBinIndex {
             for (i, child) in children.iter_mut().enumerate() {
                 let child_m = child_assigned[i];
                 if child_m > 0 {
-                    Self::select_many_and_remove_recurse(
+                    Self::select_many_and_optionally_remove_recurse(
                         child,
                         child_m,
                         child.accumulated_value,
@@ -706,13 +597,16 @@ impl DigitBinIndex {
                         rng,
                         current_depth + 1,
                         precision,
+                        with_removal,
                     );
                 }
             }
 
-            // On unwind: Update this node's counts and values based on what was removed below
-            node.content_count = children.iter().map(|c| c.content_count).sum();
-            node.accumulated_value = children.iter().map(|c| c.accumulated_value).sum();
+            if with_removal {
+                // On unwind: Update this node's counts and values based on what was removed below
+                node.content_count = children.iter().map(|c| c.content_count).sum();
+                node.accumulated_value = children.iter().map(|c| c.accumulated_value).sum();
+            }
         }
     }
 
