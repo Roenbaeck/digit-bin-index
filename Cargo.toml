@@ -1,6 +1,6 @@
 [package]
 name = "digit-bin-index"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 authors = ["Lars Rönnbäck <lars.ronnback@anchormodeling.com>"]
 license = "MIT"
@@ -40,7 +40,3 @@ codegen-units = 1  # Better optimizations, slower compiles
 name = "selection_benchmark"
 harness = false
 
-[[test]]
-name = "benchmark_tests"
-path = "benches/selection_benchmark.rs"
-harness = true

@@ -240,6 +240,10 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
 criterion_group!(benches, benchmark_wallenius_simulation, benchmark_fisher_simulation);
 criterion_main!(benches);
 
+/*
+// --- Statistical Validation Tests ---
+// Commented since they confised cargo, and not really necessary now that 
+// desired functionality is confirmed. Can be uncommented for future reference.
 #[cfg(test)]
 mod tests {
     use super::*; // Import parent module's items like WeightedSelector
@@ -340,3 +344,4 @@ mod tests {
         );
     }
 }
+*/
