@@ -151,7 +151,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-digit-bin-index = "0.2.3"    # Replace with the latest version from crates.io
+digit-bin-index = "0.2.4"    # Replace with the latest version from crates.io
 rust_decimal = "1.37"
 rust_decimal_macros = "1.37"  # Optional, for convenient decimal literals
 ```
