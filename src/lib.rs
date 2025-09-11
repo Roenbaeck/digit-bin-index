@@ -686,11 +686,11 @@ mod python {
             }
         }
 
-        fn select(&self) -> Option<(u32, String)> {
+        fn select(&mut self) -> Option<(u32, String)> {
             self.index.select().map(|(id, weight)| (id, weight.to_string()))
         }
 
-        fn select_many(&self, n: u32) -> Option<Vec<(u32, String)>> {
+        fn select_many(&mut self, n: u32) -> Option<Vec<(u32, String)>> {
             self.index.select_many(n).map(|items| {
                 items.into_iter().map(|(id, w)| (id, w.to_string())).collect()
             })
