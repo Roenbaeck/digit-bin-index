@@ -259,13 +259,8 @@ impl DigitBinIndex {
     pub fn remove(&mut self, individual_id: u32, mut weight: Decimal) {
         if let Some(digits) = self.weight_to_digits(weight) {
             weight.rescale(self.precision as u32);
-            self.remove_with_digits(individual_id, weight, digits);
+            Self::remove_recurse(&mut self.root, individual_id, weight, &digits, 1, self.precision);
         }
-    }
-
-    // Helper function
-    fn remove_with_digits(&mut self, individual_id: u32, weight: Decimal, digits: [u8; MAX_PRECISION]) {
-        Self::remove_recurse(&mut self.root, individual_id, weight, &digits, 1, self.precision);
     }
 
     /// Recursive private method to handle removing individuals.
@@ -488,16 +483,20 @@ impl DigitBinIndex {
         let mut rng = rand::thread_rng();
         let mut selected = Vec::with_capacity(num_to_draw as usize);
         let total_weight = self.root.accumulated_value;
-        // Pass precision explicitly to avoid needing self in the recursive function
+        // Generate initial random targets for the root
+        let passed_targets: Vec<Decimal> = (0..num_to_draw)
+            .map(|_| rng.gen_range(Decimal::ZERO..total_weight))
+            .collect();
+        // Call with pre-generated targets
         Self::select_many_and_optionally_remove_recurse(
             &mut self.root,
-            num_to_draw,
             total_weight,
             &mut selected,
             &mut rng,
             1,
             self.precision,
             with_removal,
+            passed_targets,
         );
         if selected.len() == num_to_draw as usize {
             Some(selected)
@@ -508,96 +507,133 @@ impl DigitBinIndex {
 
     /// Recursive helper for batch selection and removal.
     /// - node: Current subtree root.
-    /// - m: Number to select from this subtree.
-    /// - subtree_total: Accumulated weight of this node.
+    /// - subtree_total: Accumulated weight of this node (passed to avoid borrowing issues).
     /// - selected: Mutable vec to collect (id, weight) from leaves.
     /// - rng: Mutable RNG.
     /// - current_depth: Current digit level.
     /// - precision: The precision of the DigitBinIndex (passed explicitly).
+    /// - with_removal: Whether to remove selected items.
+    /// - passed_targets: Pre-computed relative targets from parent (in [0, subtree_total)).
     fn select_many_and_optionally_remove_recurse(
         node: &mut Node,
-        m: u32,
         subtree_total: Decimal,
         selected: &mut Vec<(u32, Decimal)>,
         rng: &mut ThreadRng,
         current_depth: u8,
         precision: u8,
         with_removal: bool,
+        passed_targets: Vec<Decimal>,
     ) {
-        if m == 0 {
+        let original_target_count = passed_targets.len() as u32;
+        if original_target_count == 0 {
             return;
         }
+
         if current_depth > precision {
-            // Leaf: Pick m random unique IDs from bitmap.
+            // Leaf: Pick up to original_target_count random unique IDs from bitmap.
             if let NodeContent::Leaf(bitmap) = &mut node.content {
                 let bin_weight = if node.content_count > 0 {
                     node.accumulated_value / Decimal::from(node.content_count)
                 } else {
                     Decimal::ZERO
                 };
-                let mut picked = 0;
-                while picked < m && !bitmap.is_empty() {
-                    let rand_index = rng.gen_range(0..bitmap.len() as u32);
-                    if let Some(id) = bitmap.select(rand_index) {
-                        if with_removal {
-                            bitmap.remove(id);
-                        }
-                        selected.push((id, bin_weight));
-                        picked += 1;
-                    }
+                let to_select = original_target_count.min(node.content_count);
+                
+                // Use bitmap.range to select the first to_select IDs
+                let mut selected_ids = Vec::new();
+                for id in bitmap.range(..).take(to_select as usize) {
+                    selected.push((id, bin_weight));
+                    selected_ids.push(id);
                 }
-                if with_removal {
-                    // Update node
-                    node.content_count -= picked;
-                    node.accumulated_value -= bin_weight * Decimal::from(picked);
+
+                if with_removal && !selected_ids.is_empty() {
+                    // Use remove_range to efficiently remove selected IDs
+                    let min_id = *selected_ids.first().unwrap();
+                    let max_id = *selected_ids.last().unwrap() + 1; // Exclusive end
+                    let removed = bitmap.remove_range(min_id..max_id);
+                    node.content_count -= removed as u32;
+                    node.accumulated_value -= bin_weight * Decimal::from(removed);
                 }
             }
             return;
         }
 
-        // Internal node: Assign m selections to children with rejection.
+        // Internal node: Assign to children using passed_targets first, with rejection.
         if let NodeContent::Internal(children) = &mut node.content {
-            // Prepare per-child data: assigned counts and lists of relative targets for reuse.
             let mut child_assigned = vec![0u32; children.len()];
             let mut child_rel_targets: Vec<Vec<Decimal>> = vec![Vec::new(); children.len()];
-
             let mut assigned = 0u32;
-            while assigned < m {
-                let target = rng.gen_range(Decimal::ZERO..subtree_total);
+
+            for target in passed_targets {
                 let mut cum = Decimal::ZERO;
-                let mut chosen_child = None;
+                let mut chosen_idx = None;
                 for (i, child) in children.iter().enumerate() {
+                    if child.accumulated_value.is_zero() {
+                        continue;
+                    }
                     if target < cum + child.accumulated_value {
                         if child_assigned[i] + 1 <= child.content_count {
-                            chosen_child = Some(i);
+                            chosen_idx = Some(i);
                         }
                         break;
                     }
                     cum += child.accumulated_value;
                 }
-                if let Some(idx) = chosen_child {
+                if let Some(idx) = chosen_idx {
                     child_assigned[idx] += 1;
-                    // Compute relative target for reuse in sub-level: target - cum_before_this_child
-                    let rel_target = target - (cum - children[idx].accumulated_value);
+                    let rel_target = target - cum;
                     child_rel_targets[idx].push(rel_target);
                     assigned += 1;
+                } else {
+                    // println!("Rejected target {}", target); // Debug
                 }
-                // Else: reject (redraw loop continues)
             }
 
-            // Recurse into each child with assigned > 0, passing precision
+            // Generate additional targets for any rejected ones
+            let remaining = original_target_count - assigned;
+            let mut additional_assigned = 0u32;
+            while additional_assigned < remaining {
+                let target = rng.gen_range(Decimal::ZERO..subtree_total);
+                let mut cum = Decimal::ZERO;
+                let mut chosen_idx = None;
+                for (i, child) in children.iter().enumerate() {
+                    if child.accumulated_value.is_zero() {
+                        continue;
+                    }
+                    if target < cum + child.accumulated_value {
+                        if child_assigned[i] + 1 <= child.content_count {
+                            chosen_idx = Some(i);
+                        }
+                        break;
+                    }
+                    cum += child.accumulated_value;
+                }
+                if let Some(idx) = chosen_idx {
+                    child_assigned[idx] += 1;
+                    let rel_target = target - cum;
+                    child_rel_targets[idx].push(rel_target);
+                    additional_assigned += 1;
+                } else {
+                    // println!("Rejected additional target {}", target); // Debug
+                }
+            }
+
+            // Store accumulated values to avoid immutable borrow during iteration
+            let child_weights: Vec<Decimal> = children.iter().map(|c| c.accumulated_value).collect();
+
+            // Recurse into each child with assigned > 0, passing rel_targets
             for (i, child) in children.iter_mut().enumerate() {
-                let child_m = child_assigned[i];
-                if child_m > 0 {
+                let assign = child_assigned[i];
+                if assign > 0 {
                     Self::select_many_and_optionally_remove_recurse(
                         child,
-                        child_m,
-                        child.accumulated_value,
+                        child_weights[i],
                         selected,
                         rng,
                         current_depth + 1,
                         precision,
                         with_removal,
+                        child_rel_targets[i].drain(..).collect(),
                     );
                 }
             }
@@ -609,7 +645,6 @@ impl DigitBinIndex {
             }
         }
     }
-
 
     /// Returns the total number of items currently in the index.
     ///
