@@ -165,37 +165,70 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
     let mut group = c.benchmark_group("Wallenius Simulation (Iterative Churn)");
     group.throughput(Throughput::Elements((CHURN_COUNT + ACQUISITION_COUNT) as u64));
 
-    group.bench_function(BenchmarkId::new("DigitBinIndex", INITIAL_POP), |b| {
+    group.bench_function(BenchmarkId::new("DigitBinIndex (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut dbi = DigitBinIndex::with_precision(5);
+            let mut dbi = DigitBinIndex::with_precision(3);
             let mut rng = rand::thread_rng();
-            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,4)..Decimal::new(9999,4))); }
+            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))); }
             (dbi, INITIAL_POP as u32)
         }, |(mut dbi, mut next_id)| {
             for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove()); }
             let mut rng = rand::thread_rng();
             for _ in 0..ACQUISITION_COUNT {
-                dbi.add(next_id, rng.gen_range(Decimal::new(1,4)..Decimal::new(9999,4)));
+                dbi.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3)));
                 next_id += 1;
             }
         }, criterion::BatchSize::SmallInput);
     });
 
-    group.bench_function(BenchmarkId::new("WeightedSelector", INITIAL_POP), |b| {
+    group.bench_function(BenchmarkId::new("WeightedSelector (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
             let mut selector = WeightedSelector::new(MAX_CAPACITY);
             let mut rng = rand::thread_rng();
-            for i in 0..INITIAL_POP { selector.add(i as u32, rng.gen_range(Decimal::new(1,4)..Decimal::new(9999,4))).unwrap(); }
+            for i in 0..INITIAL_POP { selector.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap(); }
             (selector, INITIAL_POP as u32)
         }, |(mut selector, mut next_id)| {
             for _ in 0..CHURN_COUNT { black_box(selector.select_and_remove()); }
             let mut rng = rand::thread_rng();
             for _ in 0..ACQUISITION_COUNT {
-                selector.add(next_id, rng.gen_range(Decimal::new(1,4)..Decimal::new(9999,4))).unwrap();
+                selector.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap();
                 next_id += 1;
             }
         }, criterion::BatchSize::SmallInput);
     });
+
+    group.bench_function(BenchmarkId::new("DigitBinIndex (precision 5)", INITIAL_POP), |b| {
+        b.iter_batched(|| {
+            let mut dbi = DigitBinIndex::with_precision(5);
+            let mut rng = rand::thread_rng();
+            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))); }
+            (dbi, INITIAL_POP as u32)
+        }, |(mut dbi, mut next_id)| {
+            for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove()); }
+            let mut rng = rand::thread_rng();
+            for _ in 0..ACQUISITION_COUNT {
+                dbi.add(next_id, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5)));
+                next_id += 1;
+            }
+        }, criterion::BatchSize::SmallInput);
+    });
+
+    group.bench_function(BenchmarkId::new("WeightedSelector (precision 5)", INITIAL_POP), |b| {
+        b.iter_batched(|| {
+            let mut selector = WeightedSelector::new(MAX_CAPACITY);
+            let mut rng = rand::thread_rng();
+            for i in 0..INITIAL_POP { selector.add(i as u32, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))).unwrap(); }
+            (selector, INITIAL_POP as u32)
+        }, |(mut selector, mut next_id)| {
+            for _ in 0..CHURN_COUNT { black_box(selector.select_and_remove()); }
+            let mut rng = rand::thread_rng();
+            for _ in 0..ACQUISITION_COUNT {
+                selector.add(next_id, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))).unwrap();
+                next_id += 1;
+            }
+        }, criterion::BatchSize::SmallInput);
+    });
+
     group.finish();
 }
 
@@ -203,37 +236,70 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
     let mut group = c.benchmark_group("Fisher Simulation (Batch Churn)");
     group.throughput(Throughput::Elements((CHURN_COUNT + ACQUISITION_COUNT) as u64));
 
-    group.bench_function(BenchmarkId::new("DigitBinIndex", INITIAL_POP), |b| {
+    group.bench_function(BenchmarkId::new("DigitBinIndex (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut dbi = DigitBinIndex::with_precision(5);
+            let mut dbi = DigitBinIndex::with_precision(3);
             let mut rng = rand::thread_rng();
-            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,4)..Decimal::new(9999,4))); }
+            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))); }
             (dbi, INITIAL_POP as u32)
         }, |(mut dbi, mut next_id)| {
             black_box(dbi.select_many_and_remove(CHURN_COUNT as u32));
             let mut rng = rand::thread_rng();
             for _ in 0..ACQUISITION_COUNT {
-                dbi.add(next_id, rng.gen_range(Decimal::new(1,4)..Decimal::new(9999,4)));
+                dbi.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3)));
                 next_id += 1;
             }
         }, criterion::BatchSize::SmallInput);
     });
 
-    group.bench_function(BenchmarkId::new("WeightedSelector", INITIAL_POP), |b| {
+    group.bench_function(BenchmarkId::new("WeightedSelector (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
             let mut selector = WeightedSelector::new(MAX_CAPACITY);
             let mut rng = rand::thread_rng();
-            for i in 0..INITIAL_POP { selector.add(i as u32, rng.gen_range(Decimal::new(1,4)..Decimal::new(9999,4))).unwrap(); }
+            for i in 0..INITIAL_POP { selector.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap(); }
             (selector, INITIAL_POP as u32)
         }, |(mut selector, mut next_id)| {
             black_box(selector.select_many_and_remove(CHURN_COUNT as u32));
             let mut rng = rand::thread_rng();
             for _ in 0..ACQUISITION_COUNT {
-                selector.add(next_id, rng.gen_range(Decimal::new(1,4)..Decimal::new(9999,4))).unwrap();
+                selector.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap();
                 next_id += 1;
             }
         }, criterion::BatchSize::SmallInput);
     });
+
+    group.bench_function(BenchmarkId::new("DigitBinIndex (precision 5)", INITIAL_POP), |b| {
+        b.iter_batched(|| {
+            let mut dbi = DigitBinIndex::with_precision(5);
+            let mut rng = rand::thread_rng();
+            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))); }
+            (dbi, INITIAL_POP as u32)
+        }, |(mut dbi, mut next_id)| {
+            black_box(dbi.select_many_and_remove(CHURN_COUNT as u32));
+            let mut rng = rand::thread_rng();
+            for _ in 0..ACQUISITION_COUNT {
+                dbi.add(next_id, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5)));
+                next_id += 1;
+            }
+        }, criterion::BatchSize::SmallInput);
+    });
+
+    group.bench_function(BenchmarkId::new("WeightedSelector (precision 5)", INITIAL_POP), |b| {
+        b.iter_batched(|| {
+            let mut selector = WeightedSelector::new(MAX_CAPACITY);
+            let mut rng = rand::thread_rng();
+            for i in 0..INITIAL_POP { selector.add(i as u32, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))).unwrap(); }
+            (selector, INITIAL_POP as u32)
+        }, |(mut selector, mut next_id)| {
+            black_box(selector.select_many_and_remove(CHURN_COUNT as u32));
+            let mut rng = rand::thread_rng();
+            for _ in 0..ACQUISITION_COUNT {
+                selector.add(next_id, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))).unwrap();
+                next_id += 1;
+            }
+        }, criterion::BatchSize::SmallInput);
+    });
+
     group.finish();
 }
 

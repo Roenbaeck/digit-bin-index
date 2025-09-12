@@ -14,7 +14,7 @@ use std::vec;
 
 // The default precision to use if none is specified in the constructor.
 const DEFAULT_PRECISION: u8 = 3;
-const MAX_PRECISION: usize = 10;
+const MAX_PRECISION: usize = 9;
 
 /// The content of a node, which is either more nodes or a leaf with individuals.
 #[derive(Debug, Clone)]
@@ -40,8 +40,8 @@ impl Node {
     /// Creates a new, empty internal node.
     fn new_internal() -> Self {
         Self {
-            content: NodeContent::Internal(vec![]),
-            accumulated_value: Decimal::from(0),
+            content: NodeContent::Internal(vec![]), 
+            accumulated_value: Decimal::ZERO,
             content_count: 0,
         }
     }
@@ -64,7 +64,7 @@ pub struct DigitBinIndex {
     /// The precision (number of decimal places) used for binning.
     pub precision: u8,
     // For weight_to_digits
-    powers: [u128; MAX_PRECISION], 
+    powers: [u32; MAX_PRECISION], 
 }
 
 impl Default for DigitBinIndex {
@@ -101,11 +101,11 @@ impl DigitBinIndex {
     ///
     /// The precision determines the number of decimal places used for binning weights.
     /// Higher precision improves sampling accuracy but increases memory usage and tree depth.
-    /// Precision must be between 1 and 10 (inclusive).
+    /// Precision must be between 1 and 9 (inclusive).
     ///
     /// # Arguments
     ///
-    /// * `precision` - The number of decimal places for binning (1 to 10).
+    /// * `precision` - The number of decimal places for binning (1 to 9).
     ///
     /// # Returns
     ///
@@ -113,7 +113,7 @@ impl DigitBinIndex {
     ///
     /// # Panics
     ///
-    /// Panics if `precision` is 0 or greater than 10.
+    /// Panics if `precision` is 0 or greater than 9.
     ///
     /// # Examples
     ///
@@ -127,9 +127,9 @@ impl DigitBinIndex {
     pub fn with_precision(precision: u8) -> Self {
         assert!(precision > 0, "Precision must be at least 1.");
         assert!(precision <= MAX_PRECISION as u8, "Precision cannot be larger than {}.", MAX_PRECISION);
-        let mut powers = [0u128; MAX_PRECISION];
+        let mut powers = [0u32; MAX_PRECISION];
         for i in 0..MAX_PRECISION {
-            powers[i] = 10u128.pow(i as u32)
+            powers[i] = 10u32.pow(i as u32)
         }
         Self {
             root: Node::new_internal(),
@@ -154,7 +154,7 @@ impl DigitBinIndex {
 
         let mut digits = [0u8; MAX_PRECISION];
         let scale = scaled.scale() as usize;
-        let mantissa = scaled.mantissa().abs() as u128;
+        let mantissa = scaled.mantissa().abs() as u32;
 
         // Extract digits from mantissa
         for i in 0..self.precision as usize {
@@ -623,6 +623,7 @@ impl DigitBinIndex {
             for (i, child) in children.iter_mut().enumerate() {
                 let assign = child_assigned[i];
                 if assign > 0 {
+                    let rel_targets = std::mem::take(&mut child_rel_targets[i]);
                     Self::select_many_and_optionally_remove_recurse(
                         child,
                         child_weights[i],
@@ -631,7 +632,7 @@ impl DigitBinIndex {
                         current_depth + 1,
                         precision,
                         with_removal,
-                        child_rel_targets[i].drain(..).collect(),
+                        rel_targets,
                     );
                 }
             }
