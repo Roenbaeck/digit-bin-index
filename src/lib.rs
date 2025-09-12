@@ -77,9 +77,9 @@ impl DigitBin for RoaringBitmap {
 #[derive(Debug, Clone)]
 pub enum NodeContent<B: DigitBin> {
     /// An internal node that contains children for the next digit (0-9).
-    Internal(Vec<Node<B>>),
+    DigitIndex(Vec<Node<B>>),
     /// A leaf node that contains a bin of IDs for individuals in this bin.
-    Leaf(B),
+    Bin(B),
 }
 
 /// A node within the DigitBinIndex tree.
@@ -97,7 +97,7 @@ impl<B: DigitBin> Node<B> {
     /// Creates a new, empty internal node.
     fn new_internal() -> Self {
         Self {
-            content: NodeContent::Internal(vec![]), 
+            content: NodeContent::DigitIndex(vec![]), 
             accumulated_value: Decimal::ZERO,
             content_count: 0,
         }
@@ -115,38 +115,54 @@ impl<B: DigitBin> Node<B> {
 /// performance of general-purpose structures like a Fenwick Tree for its
 /// ideal use case.
 ///
-/// # Type Parameters
-///
-/// * `B` - The bin container type for leaf nodes. Must implement the [`DigitBin`] trait.
-///   Common choices are [`Vec<u32>`] for maximum speed with small bins, or [`RoaringBitmap`]
-///   for memory efficiency with large, sparse bins.
-///
 /// # Examples
 ///
 /// ```
 /// use digit_bin_index::DigitBinIndex;
-/// // Use Vec<u32> for leaf bins
-/// let mut index = DigitBinIndex::<Vec<u32>>::new();
-/// // Or use RoaringBitmap for leaf bins
-/// // let mut index = DigitBinIndex::<roaring::RoaringBitmap>::new();
+/// let mut index = DigitBinIndex::with_precision_and_capacity(3, 100);
 /// ```
 #[derive(Debug, Clone)]
-pub struct DigitBinIndex<B: DigitBin> {
-    /// The root node of the tree.
-    pub root: Node<B>,
-    /// The precision (number of decimal places) used for binning.
-    pub precision: u8,
-    // For weight_to_digits
-    powers: [u32; MAX_PRECISION], 
+pub enum DigitBinIndex {
+    Vec(DigitBinIndexGeneric<Vec<u32>>),
+    Roaring(DigitBinIndexGeneric<RoaringBitmap>),
 }
 
-impl<B: DigitBin> Default for DigitBinIndex<B> {
-    fn default() -> Self {
-        Self::new()
+impl DigitBinIndex {
+    /// Creates a new DigitBinIndex with the given precision and expected capacity.
+    /// Uses Vec<u32> for small bins, RoaringBitmap for large bins.
+    ///
+    /// # Arguments
+    ///
+    /// * `precision` - The number of decimal places for binning (1 to 9).
+    /// * `capacity` - The expected number of items to be stored in the index.
+    ///
+    /// # Returns
+    ///
+    /// A new `DigitBinIndex` instance with the appropriate bin type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `precision` is 0 or greater than 9.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    ///
+    /// let index = DigitBinIndex::with_precision_and_capacity(3, 100);
+    /// // Uses Vec<u32> because capacity is small
+    /// ```
+    pub fn with_precision_and_capacity(precision: u8, capacity: usize) -> Self {
+        // Heuristic: Use RoaringBitmap if average bin size (capacity / 10^precision) exceeds threshold
+        let threshold = 1000;
+        let max_bins = 10usize.pow(precision as u32);
+        if capacity / max_bins > threshold {
+            DigitBinIndex::Roaring(DigitBinIndexGeneric::<RoaringBitmap>::with_precision(precision))
+        } else {
+            DigitBinIndex::Vec(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
+        }
     }
-}
 
-impl<B: DigitBin> DigitBinIndex<B> {
     /// Creates a new `DigitBinIndex` instance with the default precision.
     ///
     /// The default precision is set to 3 decimal places, which provides a good balance
@@ -162,12 +178,11 @@ impl<B: DigitBin> DigitBinIndex<B> {
     /// ```
     /// use digit_bin_index::DigitBinIndex;
     ///
-    /// let index = DigitBinIndex::<Vec<u32>>::new();
-    /// assert_eq!(index.precision, 3);
+    /// let index = DigitBinIndex::new();
+    /// assert_eq!(index.precision(), 3);
     /// ```    
-    #[must_use]
     pub fn new() -> Self {
-        Self::with_precision(DEFAULT_PRECISION)
+        DigitBinIndex::Vec(DigitBinIndexGeneric::<Vec<u32>>::new())
     }
 
     /// Creates a new `DigitBinIndex` instance with the specified precision.
@@ -193,9 +208,306 @@ impl<B: DigitBin> DigitBinIndex<B> {
     /// ```
     /// use digit_bin_index::DigitBinIndex;
     ///
-    /// let index = DigitBinIndex::<Vec<u32>>::with_precision(4);
-    /// assert_eq!(index.precision, 4);
+    /// let index = DigitBinIndex::with_precision(4);
+    /// assert_eq!(index.precision(), 4);
     /// ```
+    pub fn with_precision(precision: u8) -> Self {
+        DigitBinIndex::Vec(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
+    }
+
+    /// Adds an item with the given ID and weight to the index.
+    ///
+    /// The weight is rescaled to the index's precision and binned accordingly.
+    /// If the weight is non-positive or becomes zero after scaling, the item is not added.
+    ///
+    /// # Arguments
+    ///
+    /// * `individual_id` - The unique ID of the item to add (u32).
+    /// * `weight` - The positive weight (probability) of the item.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the item was successfully added, `false` otherwise (e.g., invalid weight).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    /// use rust_decimal_macros::dec;
+    ///
+    /// let mut index = DigitBinIndex::new();
+    /// let added = index.add(1, dec!(0.5));
+    /// assert!(added);
+    /// assert_eq!(index.count(), 1);
+    /// ```    
+    pub fn add(&mut self, id: u32, weight: Decimal) -> bool {
+        match self {
+            DigitBinIndex::Vec(index) => index.add(id, weight),
+            DigitBinIndex::Roaring(index) => index.add(id, weight),
+        }
+    }
+
+    /// Removes an item with the given ID and weight from the index.
+    ///
+    /// The weight must match the one used during addition (after rescaling).
+    /// If the item is not found in the corresponding bin, no removal occurs.
+    ///
+    /// # Arguments
+    ///
+    /// * `individual_id` - The ID of the item to remove.
+    /// * `weight` - The weight of the item (must match the added weight).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    /// use rust_decimal_macros::dec;
+    ///
+    /// let mut index = DigitBinIndex::new();
+    /// index.add(1, dec!(0.5));
+    /// index.remove(1, dec!(0.5));
+    /// assert_eq!(index.count(), 0);
+    /// ```
+    pub fn remove(&mut self, id: u32, weight: Decimal) {
+        match self {
+            DigitBinIndex::Vec(index) => index.remove(id, weight),
+            DigitBinIndex::Roaring(index) => index.remove(id, weight),
+        }
+    }
+
+    /// Selects a single item randomly based on weights without removal.
+    ///
+    /// Performs weighted random selection. Returns `None` if the index is empty.
+    ///
+    /// # Returns
+    ///
+    /// An `Option` containing the selected item's ID and its (rescaled) weight.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    /// use rust_decimal_macros::dec;
+    ///
+    /// let mut index = DigitBinIndex::new();
+    /// index.add(1, dec!(0.5));
+    /// if let Some((id, weight)) = index.select() {
+    ///     assert_eq!(id, 1);
+    ///     assert_eq!(weight, dec!(0.500));
+    /// }
+    /// ```
+    pub fn select(&mut self) -> Option<(u32, Decimal)> {
+        match self {
+            DigitBinIndex::Vec(index) => index.select(),
+            DigitBinIndex::Roaring(index) => index.select(),
+        }
+    }
+
+    /// Selects a single item randomly and removes it from the index.
+    ///
+    /// Combines selection and removal in one operation. Returns `None` if empty.
+    ///
+    /// # Returns
+    ///
+    /// An `Option` containing the selected item's ID and weight.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    /// use rust_decimal_macros::dec;
+    ///
+    /// let mut index = DigitBinIndex::new();
+    /// index.add(1, dec!(0.5));
+    /// if let Some((id, _)) = index.select_and_remove() {
+    ///     assert_eq!(id, 1);
+    /// }
+    /// assert_eq!(index.count(), 0);
+    /// ```
+    pub fn select_and_remove(&mut self) -> Option<(u32, Decimal)> {
+        match self {
+            DigitBinIndex::Vec(index) => index.select_and_remove(),
+            DigitBinIndex::Roaring(index) => index.select_and_remove(),
+        }
+    }
+
+    /// Selects multiple unique items randomly based on weights without removal.
+    ///
+    /// Uses rejection sampling to ensure uniqueness. Returns `None` if `num_to_draw`
+    /// exceeds the number of items in the index.
+    ///
+    /// # Arguments
+    ///
+    /// * `num_to_draw` - The number of unique items to select.
+    ///
+    /// # Returns
+    ///
+    /// An `Option` containing a vector of selected (ID, weight) pairs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    /// use rust_decimal_macros::dec;
+    ///
+    /// let mut index = DigitBinIndex::new();
+    /// index.add(1, dec!(0.3));
+    /// index.add(2, dec!(0.7));
+    /// if let Some(selected) = index.select_many(2) {
+    ///     assert_eq!(selected.len(), 2);
+    /// }
+    /// ```
+    pub fn select_many(&mut self, num_to_draw: u32) -> Option<Vec<(u32, Decimal)>> {
+        match self {
+            DigitBinIndex::Vec(index) => index.select_many(num_to_draw),
+            DigitBinIndex::Roaring(index) => index.select_many(num_to_draw),
+        }
+    }
+
+    /// Selects multiple unique items randomly and removes them from the index.
+    ///
+    /// Selects and removes in batch. Returns `None` if `num_to_draw` exceeds item count.
+    ///
+    /// # Arguments
+    ///
+    /// * `num_to_draw` - The number of unique items to select and remove.
+    ///
+    /// # Returns
+    ///
+    /// An `Option` containing a vector of selected (ID, weight) pairs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    /// use rust_decimal_macros::dec;
+    ///
+    /// let mut index = DigitBinIndex::new();
+    /// index.add(1, dec!(0.3));
+    /// index.add(2, dec!(0.7));
+    /// if let Some(selected) = index.select_many_and_remove(2) {
+    ///     assert_eq!(selected.len(), 2);
+    /// }
+    /// assert_eq!(index.count(), 0);
+    /// ```
+    pub fn select_many_and_remove(&mut self, num_to_draw: u32) -> Option<Vec<(u32, Decimal)>> {
+        match self {
+            DigitBinIndex::Vec(index) => index.select_many_and_remove(num_to_draw),
+            DigitBinIndex::Roaring(index) => index.select_many_and_remove(num_to_draw),
+        }
+    }
+
+    /// Returns the total number of items currently in the index.
+    ///
+    /// # Returns
+    ///
+    /// The count of items as a `u32`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    ///
+    /// let mut index = DigitBinIndex::new();
+    /// assert_eq!(index.count(), 0);
+    /// ```
+    pub fn count(&self) -> u32 {
+        match self {
+            DigitBinIndex::Vec(index) => index.count(),
+            DigitBinIndex::Roaring(index) => index.count(),
+        }
+    }
+
+    /// Returns the sum of all weights in the index.
+    ///
+    /// This represents the total accumulated probability mass.
+    ///
+    /// # Returns
+    ///
+    /// The total weight as a `Decimal`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    /// use rust_decimal_macros::dec;
+    ///
+    /// let mut index = DigitBinIndex::new();
+    /// index.add(1, dec!(0.5));
+    /// assert_eq!(index.total_weight(), dec!(0.500));
+    /// ```
+    pub fn total_weight(&self) -> Decimal {
+        match self {
+            DigitBinIndex::Vec(index) => index.total_weight(),
+            DigitBinIndex::Roaring(index) => index.total_weight(),
+        }
+    }
+
+    /// Prints statistics about the underlying tree.
+    pub fn print_stats(&self) {
+        match self {
+            DigitBinIndex::Vec(idx) => idx.print_stats(),
+            DigitBinIndex::Roaring(idx) => idx.print_stats(),
+        }
+    }    
+
+    /// Returns the precision (number of decimal places) used for binning.
+    pub fn precision(&self) -> u8 {
+        match self {
+            DigitBinIndex::Vec(idx) => idx.precision,
+            DigitBinIndex::Roaring(idx) => idx.precision,
+        }
+    }    
+}
+
+/// A data structure that organizes weighted items into bins based on their
+/// decimal digits to enable fast weighted random selection and updates.
+///
+/// This structure is a specialized radix tree optimized for sequential sampling
+/// (like in Wallenius' distribution). It makes a deliberate engineering trade-off:
+/// it sacrifices a small, controllable amount of precision by binning items,
+/// but in return, it achieves O(P) performance for its core operations, where P
+/// is the configured precision. This is significantly faster than the O(log N)
+/// performance of general-purpose structures like a Fenwick Tree for its
+/// ideal use case.
+///
+/// # Type Parameters
+///
+/// * `B` - The bin container type for leaf nodes. Must implement the [`DigitBin`] trait.
+///   Common choices are [`Vec<u32>`] for maximum speed with small bins, or [`RoaringBitmap`]
+///   for memory efficiency with large, sparse bins.
+///
+/// # Examples
+///
+/// ```
+/// use digit_bin_index::DigitBinIndexGeneric;
+/// // Use Vec<u32> for leaf bins
+/// let mut index = DigitBinIndexGeneric::<Vec<u32>>::new();
+/// // Or use RoaringBitmap for leaf bins
+/// // let mut index = DigitBinIndexGeneric::<roaring::RoaringBitmap>::new();
+/// ```
+#[derive(Debug, Clone)]
+pub struct DigitBinIndexGeneric<B: DigitBin> {
+    /// The root node of the tree.
+    pub root: Node<B>,
+    /// The precision (number of decimal places) used for binning.
+    pub precision: u8,
+    // For weight_to_digits
+    powers: [u32; MAX_PRECISION], 
+}
+
+impl<B: DigitBin> Default for DigitBinIndexGeneric<B> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<B: DigitBin> DigitBinIndexGeneric<B> {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_precision(DEFAULT_PRECISION)
+    }
+
     #[must_use]
     pub fn with_precision(precision: u8) -> Self {
         assert!(precision > 0, "Precision must be at least 1.");
@@ -218,7 +530,6 @@ impl<B: DigitBin> DigitBinIndex<B> {
             return None;
         }
 
-        // Rescale to desired precision
         let mut scaled = weight;
         scaled.rescale(self.precision as u32);
         if scaled.is_zero() {
@@ -229,12 +540,11 @@ impl<B: DigitBin> DigitBinIndex<B> {
         let scale = scaled.scale() as usize;
         let mantissa = scaled.mantissa().abs() as u32;
 
-        // Extract digits from mantissa
         for i in 0..self.precision as usize {
             if i >= scale {
-                digits[i] = 0; // Pad with zeros for less precise numbers
+                digits[i] = 0;
             } else {
-                digits[i] = ((mantissa / self.powers[scale - i]) % 10) as u8;
+                digits[i] = ((mantissa / self.powers[self.precision as usize - 1 - i]) % 10) as u8;
             }
         }
         Some(digits)
@@ -242,31 +552,6 @@ impl<B: DigitBin> DigitBinIndex<B> {
 
     // --- Standard Functions ---
 
-    /// Adds an item with the given ID and weight to the index.
-    ///
-    /// The weight is rescaled to the index's precision and binned accordingly.
-    /// If the weight is non-positive or becomes zero after scaling, the item is not added.
-    ///
-    /// # Arguments
-    ///
-    /// * `individual_id` - The unique ID of the item to add (u32).
-    /// * `weight` - The positive weight (probability) of the item.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the item was successfully added, `false` otherwise (e.g., invalid weight).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use digit_bin_index::DigitBinIndex;
-    /// use rust_decimal_macros::dec;
-    ///
-    /// let mut index = DigitBinIndex::<Vec<u32>>::new();
-    /// let added = index.add(1, dec!(0.5));
-    /// assert!(added);
-    /// assert_eq!(index.count(), 1);
-    /// ```    
     pub fn add(&mut self, individual_id: u32, mut weight: Decimal) -> bool {
         if let Some(digits) = self.weight_to_digits(weight) {
             weight.rescale(self.precision as u32);
@@ -290,17 +575,17 @@ impl<B: DigitBin> DigitBinIndex<B> {
         node.accumulated_value += weight;
 
         if current_depth > max_depth {
-            if let NodeContent::Internal(_) = &node.content {
-                node.content = NodeContent::Leaf(B::default());
+            if let NodeContent::DigitIndex(_) = &node.content {
+                node.content = NodeContent::Bin(B::default());
             }
-            if let NodeContent::Leaf(bin) = &mut node.content {
+            if let NodeContent::Bin(bin) = &mut node.content {
                 bin.insert(individual_id);
             }
             return;
         }
 
         let digit = digits[current_depth as usize - 1] as usize;
-        if let NodeContent::Internal(children) = &mut node.content {
+        if let NodeContent::DigitIndex(children) = &mut node.content {
             if children.len() <= digit {
                 children.resize_with(digit + 1, Node::new_internal);
             }
@@ -308,27 +593,6 @@ impl<B: DigitBin> DigitBinIndex<B> {
         }
     }
 
-    /// Removes an item with the given ID and weight from the index.
-    ///
-    /// The weight must match the one used during addition (after rescaling).
-    /// If the item is not found in the corresponding bin, no removal occurs.
-    ///
-    /// # Arguments
-    ///
-    /// * `individual_id` - The ID of the item to remove.
-    /// * `weight` - The weight of the item (must match the added weight).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use digit_bin_index::DigitBinIndex;
-    /// use rust_decimal_macros::dec;
-    ///
-    /// let mut index = DigitBinIndex::<Vec<u32>>::new();
-    /// index.add(1, dec!(0.5));
-    /// index.remove(1, dec!(0.5));
-    /// assert_eq!(index.count(), 0);
-    /// ```
     pub fn remove(&mut self, individual_id: u32, mut weight: Decimal) {
         if let Some(digits) = self.weight_to_digits(weight) {
             weight.rescale(self.precision as u32);
@@ -346,7 +610,7 @@ impl<B: DigitBin> DigitBinIndex<B> {
         max_depth: u8,
     ) -> bool {
         if current_depth > max_depth {
-            if let NodeContent::Leaf(bin) = &mut node.content {
+            if let NodeContent::Bin(bin) = &mut node.content {
                 let orig_len = bin.len();
                 bin.remove(individual_id);
                 if bin.len() < orig_len {
@@ -359,7 +623,7 @@ impl<B: DigitBin> DigitBinIndex<B> {
         }
 
         let digit = digits[current_depth as usize - 1] as usize;
-        if let NodeContent::Internal(children) = &mut node.content {
+        if let NodeContent::DigitIndex(children) = &mut node.content {
             if children.len() > digit && Self::remove_recurse(&mut children[digit], individual_id, weight, digits, current_depth + 1, max_depth) {
                 node.content_count -= 1;
                 node.accumulated_value -= weight;
@@ -372,82 +636,14 @@ impl<B: DigitBin> DigitBinIndex<B> {
 
     // --- Selection Functions ---
 
-    /// Selects a single item randomly based on weights without removal.
-    ///
-    /// Performs weighted random selection. Returns `None` if the index is empty.
-    ///
-    /// # Returns
-    ///
-    /// An `Option` containing the selected item's ID and its (rescaled) weight.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use digit_bin_index::DigitBinIndex;
-    /// use rust_decimal_macros::dec;
-    ///
-    /// let mut index = DigitBinIndex::<Vec<u32>>::new();
-    /// index.add(1, dec!(0.5));
-    /// if let Some((id, weight)) = index.select() {
-    ///     assert_eq!(id, 1);
-    ///     assert_eq!(weight, dec!(0.500));
-    /// }
-    /// ```
     pub fn select(&mut self) -> Option<(u32, Decimal)> {
         self.select_and_optionally_remove(false)
     }
 
-    /// Selects multiple unique items randomly based on weights without removal.
-    ///
-    /// Uses rejection sampling to ensure uniqueness. Returns `None` if `num_to_draw`
-    /// exceeds the number of items in the index.
-    ///
-    /// # Arguments
-    ///
-    /// * `num_to_draw` - The number of unique items to select.
-    ///
-    /// # Returns
-    ///
-    /// An `Option` containing a vector of selected (ID, weight) pairs.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use digit_bin_index::DigitBinIndex;
-    /// use rust_decimal_macros::dec;
-    ///
-    /// let mut index = DigitBinIndex::<Vec<u32>>::new();
-    /// index.add(1, dec!(0.3));
-    /// index.add(2, dec!(0.7));
-    /// if let Some(selected) = index.select_many(2) {
-    ///     assert_eq!(selected.len(), 2);
-    /// }
-    /// ```
     pub fn select_many(&mut self, num_to_draw: u32) -> Option<Vec<(u32, Decimal)>> {
         self.select_many_and_optionally_remove(num_to_draw, false)
     }
 
-    /// Selects a single item randomly and removes it from the index.
-    ///
-    /// Combines selection and removal in one operation. Returns `None` if empty.
-    ///
-    /// # Returns
-    ///
-    /// An `Option` containing the selected item's ID and weight.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use digit_bin_index::DigitBinIndex;
-    /// use rust_decimal_macros::dec;
-    ///
-    /// let mut index = DigitBinIndex::<Vec<u32>>::new();
-    /// index.add(1, dec!(0.5));
-    /// if let Some((id, _)) = index.select_and_remove() {
-    ///     assert_eq!(id, 1);
-    /// }
-    /// assert_eq!(index.count(), 0);
-    /// ```
     pub fn select_and_remove(&mut self) -> Option<(u32, Decimal)> {
         self.select_and_optionally_remove(true)
     }
@@ -471,9 +667,9 @@ impl<B: DigitBin> DigitBinIndex<B> {
         rng: &mut ThreadRng,
         with_removal: bool,
     ) -> Option<(u32, Decimal)> {
-        // Base case: Leaf node
+        // Base case: Bin node
         if current_depth > max_depth {
-            if let NodeContent::Leaf(bin) = &mut node.content {
+            if let NodeContent::Bin(bin) = &mut node.content {
                 if bin.is_empty() {
                     return None;
                 }
@@ -492,8 +688,8 @@ impl<B: DigitBin> DigitBinIndex<B> {
             return None;
         }
 
-        // Recursive case: Internal node
-        if let NodeContent::Internal(children) = &mut node.content {
+        // Recursive case: DigitIndex node
+        if let NodeContent::DigitIndex(children) = &mut node.content {
             for child in children.iter_mut() {
                 if child.accumulated_value.is_zero() {
                     continue;
@@ -521,32 +717,6 @@ impl<B: DigitBin> DigitBinIndex<B> {
         None
     } 
 
-    /// Selects multiple unique items randomly and removes them from the index.
-    ///
-    /// Selects and removes in batch. Returns `None` if `num_to_draw` exceeds item count.
-    ///
-    /// # Arguments
-    ///
-    /// * `num_to_draw` - The number of unique items to select and remove.
-    ///
-    /// # Returns
-    ///
-    /// An `Option` containing a vector of selected (ID, weight) pairs.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use digit_bin_index::DigitBinIndex;
-    /// use rust_decimal_macros::dec;
-    ///
-    /// let mut index = DigitBinIndex::<Vec<u32>>::new();
-    /// index.add(1, dec!(0.3));
-    /// index.add(2, dec!(0.7));
-    /// if let Some(selected) = index.select_many_and_remove(2) {
-    ///     assert_eq!(selected.len(), 2);
-    /// }
-    /// assert_eq!(index.count(), 0);
-    /// ```
     pub fn select_many_and_remove(&mut self, num_to_draw: u32) -> Option<Vec<(u32, Decimal)>> {
         self.select_many_and_optionally_remove(num_to_draw, true)
     }
@@ -606,7 +776,7 @@ impl<B: DigitBin> DigitBinIndex<B> {
         }
 
         if current_depth > precision {
-            if let NodeContent::Leaf(bin) = &mut node.content {
+            if let NodeContent::Bin(bin) = &mut node.content {
                 let bin_weight = if node.content_count > 0 {
                     node.accumulated_value / Decimal::from(node.content_count)
                 } else {
@@ -632,8 +802,8 @@ impl<B: DigitBin> DigitBinIndex<B> {
             return;
         }
 
-        // Internal node: Assign to children using passed_targets first, with rejection.
-        if let NodeContent::Internal(children) = &mut node.content {
+        // DigitIndex node: Assign to children using passed_targets first, with rejection.
+        if let NodeContent::DigitIndex(children) = &mut node.content {
             let mut child_assigned = vec![0u32; children.len()];
             let mut child_rel_targets: Vec<Vec<Decimal>> = vec![Vec::new(); children.len()];
             let mut assigned = 0u32;
@@ -721,44 +891,118 @@ impl<B: DigitBin> DigitBinIndex<B> {
         }
     }
 
-    /// Returns the total number of items currently in the index.
-    ///
-    /// # Returns
-    ///
-    /// The count of items as a `u32`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use digit_bin_index::DigitBinIndex;
-    ///
-    /// let mut index = DigitBinIndex::<Vec<u32>>::new();
-    /// assert_eq!(index.count(), 0);
-    /// ```
     pub fn count(&self) -> u32 {
         self.root.content_count
     }
 
-    /// Returns the sum of all weights in the index.
-    ///
-    /// This represents the total accumulated probability mass.
-    ///
-    /// # Returns
-    ///
-    /// The total weight as a `Decimal`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use digit_bin_index::DigitBinIndex;
-    /// use rust_decimal_macros::dec;
-    ///
-    /// let mut index = DigitBinIndex::<Vec<u32>>::new();
-    /// index.add(1, dec!(0.5));
-    /// assert_eq!(index.total_weight(), dec!(0.500));
-    /// ```
     pub fn total_weight(&self) -> Decimal {
         self.root.accumulated_value
+    }
+
+    /// Prints statistics about the tree: node count, bin stats, and weight stats.
+    pub fn print_stats(&self) {
+        struct Stats {
+            node_count: usize,
+            non_empty_node_count: usize,
+            bin_count: usize,
+            min_bin_size: Option<usize>,
+            max_bin_size: Option<usize>,
+            total_bin_items: usize,
+            min_weight: Option<Decimal>,
+            max_weight: Option<Decimal>,
+            total_weight: Decimal,
+        }
+
+        fn traverse<B: DigitBin>(
+            node: &Node<B>,
+            stats: &mut Stats,
+            precision: u8,
+            current_depth: u8,
+            path: &str,
+        ) {
+            stats.node_count += 1;
+            let is_non_empty = node.content_count > 0;
+            if is_non_empty {
+                stats.non_empty_node_count += 1;
+            }
+            /* 
+            println!(
+                "Node at depth {} (path: {}): content_count = {}, non_empty = {}",
+                current_depth, path, node.content_count, is_non_empty
+            );
+            */
+            match &node.content {
+                NodeContent::DigitIndex(children) => {
+                    for (i, child) in children.iter().enumerate() {
+                        let new_path = format!("{} -> {}", path, i);
+                        traverse(child, stats, precision, current_depth + 1, &new_path);
+                    }
+                }
+                NodeContent::Bin(bin) => {
+                    let bin_size = bin.len();
+                    stats.bin_count += 1;
+                    stats.total_bin_items += bin_size;
+                    stats.min_bin_size = Some(stats.min_bin_size.map_or(bin_size, |min| min.min(bin_size)));
+                    stats.max_bin_size = Some(stats.max_bin_size.map_or(bin_size, |max| max.max(bin_size)));
+
+                    if bin_size > 0 {
+                        let weight = node.accumulated_value / Decimal::from(node.content_count);
+                        stats.min_weight = Some(stats.min_weight.map_or(weight, |min| min.min(weight)));
+                        stats.max_weight = Some(stats.max_weight.map_or(weight, |max| max.max(weight)));
+                        stats.total_weight += node.accumulated_value;
+                    }
+                }
+            }
+        }
+
+        let mut stats = Stats {
+            node_count: 0,
+            non_empty_node_count: 0,
+            bin_count: 0,
+            min_bin_size: None,
+            max_bin_size: None,
+            total_bin_items: 0,
+            min_weight: None,
+            max_weight: None,
+            total_weight: Decimal::ZERO,
+        };
+
+        traverse(&self.root, &mut stats, self.precision, 1, "Root");
+
+        let avg_bin_size = if stats.bin_count > 0 {
+            stats.total_bin_items as f64 / stats.bin_count as f64
+        } else {
+            0.0
+        };
+        let avg_weight = if stats.bin_count > 0 {
+            stats.total_weight / Decimal::from(stats.bin_count as u32)
+        } else {
+            Decimal::ZERO
+        };
+
+        println!("DigitBinIndex statistics:");
+        println!("  Total nodes: {}", stats.node_count);
+        println!("  Non-empty nodes: {}", stats.non_empty_node_count);
+        println!("  Total bins (leaves): {}", stats.bin_count);
+        println!("  Total items: {}", stats.total_bin_items);
+        println!("  Average items per bin: {:.2}", avg_bin_size);
+        println!(
+            "  Smallest bin size: {}",
+            stats.min_bin_size.map_or_else(|| "-".to_string(), |v| v.to_string())
+        );
+        println!(
+            "  Largest bin size: {}",
+            stats.max_bin_size.map_or_else(|| "-".to_string(), |v| v.to_string())
+        );
+        println!(
+            "  Smallest represented weight: {}",
+            stats.min_weight.map_or_else(|| "-".to_string(), |v| v.to_string())
+        );
+        println!(
+            "  Largest represented weight: {}",
+            stats.max_weight.map_or_else(|| "-".to_string(), |v| v.to_string())
+        );
+        println!("  Average weight: {}", avg_weight);
     }
 }
 
@@ -839,11 +1083,12 @@ mod tests {
 
     #[test]
     fn test_select_and_remove() {
-        let mut index = DigitBinIndex::<Vec<u32>>::with_precision(3);
+        let mut index = DigitBinIndex::with_precision(3);
         index.add(1, dec!(0.085));
         index.add(2, dec!(0.205));
         index.add(3, dec!(0.346));
         index.add(4, dec!(0.364));
+        index.print_stats();
         println!("Initial state: {} individuals, total weight = {}", index.count(), index.total_weight());    
         if let Some((id, weight)) = index.select_and_remove() {
             println!("Selected ID: {} with weight: {}", id, weight);
@@ -880,7 +1125,7 @@ mod tests {
         let mut total_high_risk_selected = 0;
 
         for _ in 0..NUM_SIMULATIONS {
-            let mut index = DigitBinIndex::<Vec<u32>>::with_precision(3);
+            let mut index = DigitBinIndex::with_precision_and_capacity(3, TOTAL_ITEMS as usize);
             for i in 0..ITEMS_PER_GROUP { index.add(i, low_risk_weight); }
             for i in ITEMS_PER_GROUP..TOTAL_ITEMS { index.add(i, high_risk_weight); }
 
@@ -941,7 +1186,7 @@ mod tests {
         let mut total_high_risk_selected = 0;
 
         for _ in 0..NUM_SIMULATIONS {
-            let mut index = DigitBinIndex::<Vec<u32>>::with_precision(3);
+            let mut index = DigitBinIndex::with_precision_and_capacity(3, TOTAL_ITEMS as usize);
             for i in 0..ITEMS_PER_GROUP { index.add(i, low_risk_weight); }
             for i in ITEMS_PER_GROUP..TOTAL_ITEMS { index.add(i, high_risk_weight); }
             

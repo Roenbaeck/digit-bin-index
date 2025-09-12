@@ -159,6 +159,11 @@ const CHURN_COUNT: usize = 100_000;
 const ACQUISITION_COUNT: usize = 110_000;
 const MAX_CAPACITY: usize = INITIAL_POP + ACQUISITION_COUNT;
 
+const VERY_LARGE_POP: usize = 100_000_000;
+const VERY_LARGE_CHURN: usize = 1_000_000;
+const VERY_LARGE_ACQ: usize = 1_000_000;
+const VERY_LARGE_MAX: usize = VERY_LARGE_POP + VERY_LARGE_ACQ;
+
 // --- Benchmarks (No changes needed here, the logic is identical) ---
 
 fn benchmark_wallenius_simulation(c: &mut Criterion) {
@@ -167,7 +172,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut dbi = DigitBinIndex::<Vec<u32>>::with_precision(3);
+            let mut dbi = DigitBinIndex::with_precision_and_capacity(3, MAX_CAPACITY);
             let mut rng = rand::thread_rng();
             for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))); }
             (dbi, INITIAL_POP as u32)
@@ -199,7 +204,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut dbi = DigitBinIndex::<Vec<u32>>::with_precision(5);
+            let mut dbi = DigitBinIndex::with_precision_and_capacity(5, MAX_CAPACITY);
             let mut rng = rand::thread_rng();
             for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))); }
             (dbi, INITIAL_POP as u32)
@@ -228,6 +233,44 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
             }
         }, criterion::BatchSize::SmallInput);
     });
+
+    group.sample_size(10); 
+
+    group.bench_function(BenchmarkId::new("DigitBinIndex (very large, Roaring)", VERY_LARGE_POP), |b| {
+        b.iter_batched(|| {
+            let mut dbi = DigitBinIndex::with_precision_and_capacity(3, VERY_LARGE_MAX);
+            let mut rng = rand::thread_rng();
+            for i in 0..VERY_LARGE_POP {
+                dbi.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3)));
+            }
+            (dbi, VERY_LARGE_POP as u32)
+        }, |(mut dbi, mut next_id)| {
+            for _ in 0..VERY_LARGE_CHURN { black_box(dbi.select_and_remove()); }
+            let mut rng = rand::thread_rng();
+            for _ in 0..VERY_LARGE_ACQ {
+                dbi.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3)));
+                next_id += 1;
+            }
+        }, criterion::BatchSize::SmallInput);
+    });
+
+    group.bench_function(BenchmarkId::new("WeightedSelector (very large, FenwickTree)", VERY_LARGE_POP), |b| {
+        b.iter_batched(|| {
+            let mut selector = WeightedSelector::new(VERY_LARGE_MAX);
+            let mut rng = rand::thread_rng();
+            for i in 0..VERY_LARGE_POP {
+                selector.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap();
+            }
+            (selector, VERY_LARGE_POP as u32)
+        }, |(mut selector, mut next_id)| {
+            for _ in 0..VERY_LARGE_CHURN { black_box(selector.select_and_remove()); }
+            let mut rng = rand::thread_rng();
+            for _ in 0..VERY_LARGE_ACQ {
+                selector.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap();
+                next_id += 1;
+            }
+        }, criterion::BatchSize::SmallInput);
+    });    
 
     group.finish();
 }
@@ -238,7 +281,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut dbi = DigitBinIndex::<Vec<u32>>::with_precision(3);
+            let mut dbi = DigitBinIndex::with_precision_and_capacity(3, MAX_CAPACITY);
             let mut rng = rand::thread_rng();
             for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))); }
             (dbi, INITIAL_POP as u32)
@@ -270,7 +313,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut dbi = DigitBinIndex::<Vec<u32>>::with_precision(5);
+            let mut dbi = DigitBinIndex::with_precision_and_capacity(5, MAX_CAPACITY);
             let mut rng = rand::thread_rng();
             for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))); }
             (dbi, INITIAL_POP as u32)
@@ -299,6 +342,44 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
             }
         }, criterion::BatchSize::SmallInput);
     });
+
+    group.sample_size(10); 
+
+    group.bench_function(BenchmarkId::new("DigitBinIndex (very large, Roaring)", VERY_LARGE_POP), |b| {
+        b.iter_batched(|| {
+            let mut dbi = DigitBinIndex::with_precision_and_capacity(3, VERY_LARGE_MAX);
+            let mut rng = rand::thread_rng();
+            for i in 0..VERY_LARGE_POP {
+                dbi.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3)));
+            }
+            (dbi, VERY_LARGE_POP as u32)
+        }, |(mut dbi, mut next_id)| {
+            black_box(dbi.select_many_and_remove(VERY_LARGE_CHURN as u32));
+            let mut rng = rand::thread_rng();
+            for _ in 0..VERY_LARGE_ACQ {
+                dbi.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3)));
+                next_id += 1;
+            }
+        }, criterion::BatchSize::SmallInput);
+    });
+
+    group.bench_function(BenchmarkId::new("WeightedSelector (very large, FenwickTree)", VERY_LARGE_POP), |b| {
+        b.iter_batched(|| {
+            let mut selector = WeightedSelector::new(VERY_LARGE_MAX);
+            let mut rng = rand::thread_rng();
+            for i in 0..VERY_LARGE_POP {
+                selector.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap();
+            }
+            (selector, VERY_LARGE_POP as u32)
+        }, |(mut selector, mut next_id)| {
+            black_box(selector.select_many_and_remove(VERY_LARGE_CHURN as u32));
+            let mut rng = rand::thread_rng();
+            for _ in 0..VERY_LARGE_ACQ {
+                selector.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap();
+                next_id += 1;
+            }
+        }, criterion::BatchSize::SmallInput);
+    });    
 
     group.finish();
 }
