@@ -167,7 +167,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut dbi = DigitBinIndex::with_precision(3);
+            let mut dbi = DigitBinIndex::<Vec<u32>>::with_precision(3);
             let mut rng = rand::thread_rng();
             for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))); }
             (dbi, INITIAL_POP as u32)
@@ -199,7 +199,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut dbi = DigitBinIndex::with_precision(5);
+            let mut dbi = DigitBinIndex::<Vec<u32>>::with_precision(5);
             let mut rng = rand::thread_rng();
             for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))); }
             (dbi, INITIAL_POP as u32)
@@ -238,7 +238,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut dbi = DigitBinIndex::with_precision(3);
+            let mut dbi = DigitBinIndex::<Vec<u32>>::with_precision(3);
             let mut rng = rand::thread_rng();
             for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))); }
             (dbi, INITIAL_POP as u32)
@@ -270,7 +270,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut dbi = DigitBinIndex::with_precision(5);
+            let mut dbi = DigitBinIndex::<Vec<u32>>::with_precision(5);
             let mut rng = rand::thread_rng();
             for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))); }
             (dbi, INITIAL_POP as u32)
