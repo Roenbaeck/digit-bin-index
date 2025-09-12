@@ -530,7 +530,6 @@ impl DigitBinIndex {
         }
 
         if current_depth > precision {
-            // Leaf: Pick up to original_target_count random unique IDs from bitmap.
             if let NodeContent::Leaf(bitmap) = &mut node.content {
                 let bin_weight = if node.content_count > 0 {
                     node.accumulated_value / Decimal::from(node.content_count)
@@ -538,21 +537,20 @@ impl DigitBinIndex {
                     Decimal::ZERO
                 };
                 let to_select = original_target_count.min(node.content_count);
-                
-                // Use bitmap.range to select the first to_select IDs
-                let mut selected_ids = Vec::new();
-                for id in bitmap.range(..).take(to_select as usize) {
-                    selected.push((id, bin_weight));
-                    selected_ids.push(id);
+                let mut picked = 0u32;
+                while picked < to_select && !bitmap.is_empty() {
+                    let rand_index = rng.gen_range(0..bitmap.len() as u32);
+                    if let Some(id) = bitmap.select(rand_index) {
+                        selected.push((id, bin_weight));
+                        if with_removal {
+                            bitmap.remove(id);
+                        }
+                        picked += 1;
+                    }
                 }
-
-                if with_removal && !selected_ids.is_empty() {
-                    // Use remove_range to efficiently remove selected IDs
-                    let min_id = *selected_ids.first().unwrap();
-                    let max_id = *selected_ids.last().unwrap() + 1; // Exclusive end
-                    let removed = bitmap.remove_range(min_id..max_id);
-                    node.content_count -= removed as u32;
-                    node.accumulated_value -= bin_weight * Decimal::from(removed);
+                if with_removal {
+                    node.content_count -= picked;
+                    node.accumulated_value -= bin_weight * Decimal::from(picked);
                 }
             }
             return;
