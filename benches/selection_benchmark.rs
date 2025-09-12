@@ -159,7 +159,7 @@ const CHURN_COUNT: usize = 100_000;
 const ACQUISITION_COUNT: usize = 110_000;
 const MAX_CAPACITY: usize = INITIAL_POP + ACQUISITION_COUNT;
 
-const VERY_LARGE_POP: usize = 100_000_000;
+const VERY_LARGE_POP: usize = 10_000_000;
 const VERY_LARGE_CHURN: usize = 1_000_000;
 const VERY_LARGE_ACQ: usize = 1_000_000;
 const VERY_LARGE_MAX: usize = VERY_LARGE_POP + VERY_LARGE_ACQ;

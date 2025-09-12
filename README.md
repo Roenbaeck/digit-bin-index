@@ -17,7 +17,7 @@ In simulations, forecasts, or statistical models (e.g., [mortality models](https
 
 1. **Digit-based Tree Structure**: Each level of the tree corresponds to a decimal place of the rescaled weight. For example, a weight of `0.543` at precision 3 is rescaled to `543` and placed by traversing the path: `root -> child[5] -> child[4] -> child[3]`.
 
-2. **Roaring Bitmap Bins**: Leaf nodes act as bins, storing item IDs in a [Roaring Bitmap](https://roaringbitmap.org/), a compressed data structure optimized for fast set operations. This enables efficient unique sampling, particularly for Fisher's distribution.
+2. **Adaptive Bin Storage**: Leaf nodes act as bins, storing item IDs in either a fast `Vec<u32>` (for small bins) or a compressed [Roaring Bitmap](https://roaringbitmap.org/) (for large bins). The bin type is chosen automatically for optimal performance and memory use if a capacity hint is given.
 
 3. **Accumulated Value Index**: Each node tracks the `accumulated_value` (sum of weights beneath it), supporting O(P) weighted random selection, where P is the configured precision (number of decimal places).
 
@@ -118,7 +118,13 @@ from digit_bin_index import DigitBinIndex
 
 def main():
     # Create an index with precision 3 (default).
-    index = DigitBinIndex(precision=3)
+    index = DigitBinIndex()
+
+    # With custom precision
+    index_5 = DigitBinIndex.with_precision(5)
+
+    # With custom precision and capacity
+    index_3_XL = DigitBinIndex.with_precision_and_capacity(3, 10_000_000)
 
     # Add items with IDs and weights.
     index.add(id=101, weight=0.123)  # Low weight
@@ -151,7 +157,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-digit-bin-index = "0.2.4"    # Replace with the latest version from crates.io
+digit-bin-index = "0.2.5"    # Replace with the latest version from crates.io
 rust_decimal = "1.37"
 rust_decimal_macros = "1.37"  # Optional, for convenient decimal literals
 ```

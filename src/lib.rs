@@ -1014,17 +1014,33 @@ mod python {
 
     #[pyclass(name = "DigitBinIndex")]
     struct PyDigitBinIndex {
-        index: DigitBinIndex<Vec<u32>>,
+        index: DigitBinIndex,
     }
 
     #[pymethods]
     impl PyDigitBinIndex {
         #[new]
-        fn new(precision: u32) -> Self {
+        fn new() -> Self {
             PyDigitBinIndex {
-                index: DigitBinIndex::<Vec<u32>>::with_precision(precision.try_into().unwrap()),
+                index: DigitBinIndex::new(),
             }
         }
+
+        /// Create a DigitBinIndex with a specific precision.
+        #[staticmethod]
+        fn with_precision(precision: u32) -> Self {
+            PyDigitBinIndex {
+                index: DigitBinIndex::with_precision(precision.try_into().unwrap()),
+            }
+        }
+
+        /// Create a DigitBinIndex with a specific precision and expected capacity.
+        #[staticmethod]
+        fn with_precision_and_capacity(precision: u32, capacity: usize) -> Self {
+            PyDigitBinIndex {
+                index: DigitBinIndex::with_precision_and_capacity(precision.try_into().unwrap(), capacity),
+            }
+        }        
 
         fn add(&mut self, id: u32, weight: f64) -> bool {
             if let Some(decimal_weight) = Decimal::from_f64(weight) {
