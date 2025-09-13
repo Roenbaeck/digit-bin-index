@@ -271,6 +271,7 @@ dependencies = [
  "roaring",
  "rust_decimal",
  "rust_decimal_macros",
+ "wyrand",
 ]
 
 [[package]]
@@ -1017,6 +1018,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21a0236b59786fed61e2a80582dd500fe61f18b5dca67a4a067d0bc9039339cf"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "wyrand"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63970b9a6bb8379f699f260682532f50682616a09980b4ac612335214ba4ef1e"
+dependencies = [
+ "rand_core",
 ]
 
 [[package]]

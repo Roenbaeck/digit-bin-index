@@ -8,7 +8,8 @@
 //! noncentral hypergeometric distribution.
 
 use rust_decimal::Decimal;
-use rand::{rngs::ThreadRng, Rng};
+use wyrand::WyRand;
+use rand::{Rng, SeedableRng}; 
 use roaring::RoaringBitmap;
 use std::vec;
 
@@ -653,7 +654,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         if self.root.content_count == 0 {
             return None;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = WyRand::from_entropy();
         let random_target = rng.gen_range(Decimal::ZERO..self.root.accumulated_value);
         Self::select_and_optionally_remove_recurse(&mut self.root, random_target, 1, self.precision, &mut rng, with_removal)
     }
@@ -664,7 +665,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         mut target: Decimal,
         current_depth: u8,
         max_depth: u8,
-        rng: &mut ThreadRng,
+        rng: &mut WyRand,
         with_removal: bool,
     ) -> Option<(u32, Decimal)> {
         // Base case: Bin node
@@ -726,7 +727,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         if num_to_draw > self.count() || num_to_draw == 0 {
             return if num_to_draw == 0 { Some(Vec::new()) } else { None };
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = WyRand::from_entropy();
         let mut selected = Vec::with_capacity(num_to_draw as usize);
         let total_weight = self.root.accumulated_value;
         // Generate initial random targets for the root
@@ -764,7 +765,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         node: &mut Node<B>,
         subtree_total: Decimal,
         selected: &mut Vec<(u32, Decimal)>,
-        rng: &mut ThreadRng,
+        rng: &mut WyRand,
         current_depth: u8,
         precision: u8,
         with_removal: bool,

@@ -13,6 +13,7 @@ categories = ["data-structures", "algorithms", "science", "simulation"]
 [dependencies]
 rust_decimal = { version = "1.37", features = ["rand"] }
 rust_decimal_macros = "1.37"
+wyrand = "0.2"
 rand = "0.8" # Compatible with rust_decimal
 roaring = "0.11"
 

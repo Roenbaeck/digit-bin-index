@@ -2,7 +2,8 @@ use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
 use digit_bin_index::DigitBinIndex;
-use rand::Rng;
+use wyrand::WyRand;
+use rand::{Rng, SeedableRng}; 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::HashMap; 
@@ -83,7 +84,7 @@ impl WeightedSelector {
     // CHANGED: Signature now matches DigitBinIndex
     pub fn select_and_remove(&mut self) -> Option<(u32, Decimal)> {
         if self.ft.total_weight.is_zero() { return None; }
-        let mut rng = rand::thread_rng();
+        let mut rng = WyRand::from_entropy();
         let target = rng.gen_range(Decimal::ZERO..self.ft.total_weight);
         let index = self.ft.find(target);
         let id = self.index_to_id[index];
@@ -105,7 +106,7 @@ impl WeightedSelector {
         if num_to_draw > current_pop_size { return None; }
         if self.ft.total_weight.is_zero() || num_to_draw == 0 { return Some(Vec::new()); }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = WyRand::from_entropy();
 
         // Collect active items and shuffle
         let mut active: Vec<(u32, Decimal, f64, usize)> = self
@@ -173,12 +174,12 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(3, MAX_CAPACITY);
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))); }
             (dbi, INITIAL_POP as u32)
         }, |(mut dbi, mut next_id)| {
             for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove()); }
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for _ in 0..ACQUISITION_COUNT {
                 dbi.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3)));
                 next_id += 1;
@@ -189,12 +190,12 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("WeightedSelector (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
             let mut selector = WeightedSelector::new(MAX_CAPACITY);
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for i in 0..INITIAL_POP { selector.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap(); }
             (selector, INITIAL_POP as u32)
         }, |(mut selector, mut next_id)| {
             for _ in 0..CHURN_COUNT { black_box(selector.select_and_remove()); }
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for _ in 0..ACQUISITION_COUNT {
                 selector.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap();
                 next_id += 1;
@@ -205,12 +206,12 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(5, MAX_CAPACITY);
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))); }
             (dbi, INITIAL_POP as u32)
         }, |(mut dbi, mut next_id)| {
             for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove()); }
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for _ in 0..ACQUISITION_COUNT {
                 dbi.add(next_id, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5)));
                 next_id += 1;
@@ -221,12 +222,12 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("WeightedSelector (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
             let mut selector = WeightedSelector::new(MAX_CAPACITY);
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for i in 0..INITIAL_POP { selector.add(i as u32, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))).unwrap(); }
             (selector, INITIAL_POP as u32)
         }, |(mut selector, mut next_id)| {
             for _ in 0..CHURN_COUNT { black_box(selector.select_and_remove()); }
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for _ in 0..ACQUISITION_COUNT {
                 selector.add(next_id, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))).unwrap();
                 next_id += 1;
@@ -239,14 +240,14 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("DigitBinIndex (very large, Roaring)", VERY_LARGE_POP), |b| {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(3, VERY_LARGE_MAX);
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for i in 0..VERY_LARGE_POP {
                 dbi.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3)));
             }
             (dbi, VERY_LARGE_POP as u32)
         }, |(mut dbi, mut next_id)| {
             for _ in 0..VERY_LARGE_CHURN { black_box(dbi.select_and_remove()); }
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for _ in 0..VERY_LARGE_ACQ {
                 dbi.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3)));
                 next_id += 1;
@@ -257,14 +258,14 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("WeightedSelector (very large, FenwickTree)", VERY_LARGE_POP), |b| {
         b.iter_batched(|| {
             let mut selector = WeightedSelector::new(VERY_LARGE_MAX);
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for i in 0..VERY_LARGE_POP {
                 selector.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap();
             }
             (selector, VERY_LARGE_POP as u32)
         }, |(mut selector, mut next_id)| {
             for _ in 0..VERY_LARGE_CHURN { black_box(selector.select_and_remove()); }
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for _ in 0..VERY_LARGE_ACQ {
                 selector.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap();
                 next_id += 1;
@@ -282,12 +283,12 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(3, MAX_CAPACITY);
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))); }
             (dbi, INITIAL_POP as u32)
         }, |(mut dbi, mut next_id)| {
             black_box(dbi.select_many_and_remove(CHURN_COUNT as u32));
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for _ in 0..ACQUISITION_COUNT {
                 dbi.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3)));
                 next_id += 1;
@@ -298,12 +299,12 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("WeightedSelector (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
             let mut selector = WeightedSelector::new(MAX_CAPACITY);
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for i in 0..INITIAL_POP { selector.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap(); }
             (selector, INITIAL_POP as u32)
         }, |(mut selector, mut next_id)| {
             black_box(selector.select_many_and_remove(CHURN_COUNT as u32));
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for _ in 0..ACQUISITION_COUNT {
                 selector.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap();
                 next_id += 1;
@@ -314,12 +315,12 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(5, MAX_CAPACITY);
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for i in 0..INITIAL_POP { dbi.add(i as u32, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))); }
             (dbi, INITIAL_POP as u32)
         }, |(mut dbi, mut next_id)| {
             black_box(dbi.select_many_and_remove(CHURN_COUNT as u32));
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for _ in 0..ACQUISITION_COUNT {
                 dbi.add(next_id, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5)));
                 next_id += 1;
@@ -330,12 +331,12 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("WeightedSelector (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
             let mut selector = WeightedSelector::new(MAX_CAPACITY);
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for i in 0..INITIAL_POP { selector.add(i as u32, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))).unwrap(); }
             (selector, INITIAL_POP as u32)
         }, |(mut selector, mut next_id)| {
             black_box(selector.select_many_and_remove(CHURN_COUNT as u32));
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for _ in 0..ACQUISITION_COUNT {
                 selector.add(next_id, rng.gen_range(Decimal::new(1,5)..Decimal::new(99999,5))).unwrap();
                 next_id += 1;
@@ -348,14 +349,14 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("DigitBinIndex (very large, Roaring)", VERY_LARGE_POP), |b| {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(3, VERY_LARGE_MAX);
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for i in 0..VERY_LARGE_POP {
                 dbi.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3)));
             }
             (dbi, VERY_LARGE_POP as u32)
         }, |(mut dbi, mut next_id)| {
             black_box(dbi.select_many_and_remove(VERY_LARGE_CHURN as u32));
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for _ in 0..VERY_LARGE_ACQ {
                 dbi.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3)));
                 next_id += 1;
@@ -366,14 +367,14 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("WeightedSelector (very large, FenwickTree)", VERY_LARGE_POP), |b| {
         b.iter_batched(|| {
             let mut selector = WeightedSelector::new(VERY_LARGE_MAX);
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for i in 0..VERY_LARGE_POP {
                 selector.add(i as u32, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap();
             }
             (selector, VERY_LARGE_POP as u32)
         }, |(mut selector, mut next_id)| {
             black_box(selector.select_many_and_remove(VERY_LARGE_CHURN as u32));
-            let mut rng = rand::thread_rng();
+            let mut rng = WyRand::from_entropy();
             for _ in 0..VERY_LARGE_ACQ {
                 selector.add(next_id, rng.gen_range(Decimal::new(1,3)..Decimal::new(999,3))).unwrap();
                 next_id += 1;
