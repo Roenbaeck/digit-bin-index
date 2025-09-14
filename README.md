@@ -4,8 +4,8 @@ A `DigitBinIndex` is a tree-based data structure designed for efficient weighted
 
 This library provides high-performance solutions for both major types of noncentral hypergeometric distributions:
 
-* **Sequential Sampling (Wallenius')**: Modeled by `select_and_remove`, where items are selected and removed one at a time.
-* **Simultaneous Sampling (Fisher's)**: Modeled by `select_many_and_remove`, where a batch of unique items is selected and removed together.
+*   **Sequential Sampling (Wallenius')**: Modeled by `select_and_remove`, where items are selected and removed one at a time.
+*   **Simultaneous Sampling (Fisher's)**: Modeled by `select_many_and_remove`, where a batch of unique items is selected and removed together.
 
 ### The Core Problem
 
@@ -15,45 +15,59 @@ In simulations, forecasts, or statistical models (e.g., [mortality models](https
 
 `DigitBinIndex` is a radix tree that organizes items into bins based on the decimal digits of their rescaled probabilities, enabling fast weighted random selection and updates.
 
-1. **Digit-based Tree Structure**: Each level of the tree corresponds to a decimal place of the rescaled weight. For example, a weight of `0.543` at precision 3 is rescaled to `543` and placed by traversing the path: `root -> child[5] -> child[4] -> child[3]`.
+1.  **Digit-based Tree Structure**: Each level of the tree corresponds to a decimal place of the rescaled weight. For example, a weight of `0.543` at precision 3 is rescaled to `543` and placed by traversing the path: `root -> child[5] -> child[4] -> child[3]`.
 
-2. **Adaptive Bin Storage**: Leaf nodes act as bins, storing item IDs in either a fast `Vec<u32>` (for small bins) or a compressed [Roaring Bitmap](https://roaringbitmap.org/) (for large bins). The bin type is chosen automatically for optimal performance and memory use if a capacity hint is given.
+2.  **Adaptive Bin Storage**: Leaf nodes act as bins, storing item IDs in either a fast `Vec<u32>` (for small bins) or a compressed [Roaring Bitmap](https://roaringbitmap.org/) (for large bins). The bin type is chosen automatically for optimal performance and memory use if a capacity hint is given.
 
-3. **Accumulated Value Index**: Each node tracks the `accumulated_value` (sum of weights beneath it), supporting O(P) weighted random selection, where P is the configured precision (number of decimal places).
+3.  **Accumulated Value Index**: Each node tracks the `accumulated_value` (sum of weights beneath it), supporting O(P) weighted random selection, where P is the configured precision (number of decimal places).
 
 ### Features
 
-* **High Performance**: Outperforms general-purpose data structures like Fenwick Trees for both sequential and simultaneous weighted sampling.
-* **Dual-Model Support**: Optimized methods for Wallenius' (`select_and_remove`) and Fisher's (`select_many_and_remove`) distributions.
-* **O(P) Complexity**: Core operations (add, remove, select) have a time complexity of O(P), where P is the fixed precision, effectively constant for a given configuration.
-* **Memory Efficiency**: Combines a sparse radix tree with Roaring Bitmaps for efficient storage, especially for sparse or clustered weight distributions.
-* **Python Integration**: Seamless Python bindings via `pyo3` for cross-language support.
+*   **High Performance**: Outperforms general-purpose data structures like Fenwick Trees for both sequential and simultaneous weighted sampling.
+*   **Dual-Model Support**: Optimized methods for Wallenius' (`select_and_remove`) and Fisher's (`select_many_and_remove`) distributions.
+*   **O(P) Complexity**: Core operations (add, remove, select) have a time complexity of O(P), where P is the fixed precision, effectively constant for a given configuration.
+*   **Memory Efficiency**: Combines a sparse radix tree with Roaring Bitmaps for efficient storage, especially for sparse or clustered weight distributions.
+*   **Python Integration**: Seamless Python bindings via `pyo3` for cross-language support.
 
 ---
 
 ### Performance
 
-`DigitBinIndex` trades a small, controllable amount of precision by binning probabilities to achieve significant performance gains. Below are benchmarks comparing `DigitBinIndex` against an optimized Fenwick Tree implementation, run on a standard desktop (Intel i7, 16GB RAM, Rust 1.75) with typical weight distributions.
+`DigitBinIndex` trades a small, controllable amount of precision by binning probabilities to achieve significant performance gains. The following benchmarks compare `DigitBinIndex` against an optimized `FenwickTree` implementation in a realistic, high-churn simulation.
 
-#### Wallenius' Draw (Sequential Selections)
+The benchmark scenario starts with a large population (1M or 10M items), then simulates a high volume of activity:
+*   **Churn**: A significant number of items are selected and removed.
+*   **Acquisition**: New items are added to the population.
 
-Measures the total time for 1,000 `select_and_remove` operations, selecting and removing one item at a time. `DigitBinIndex`'s O(P) complexity provides a significant advantage as dataset size grows.
+This measures the real-world throughput of both data structures under dynamic conditions. The tests were run on a standard desktop (Intel i7, 16GB RAM, Rust 1.75).
 
-| Number of Items (N) | `DigitBinIndex` Loop Time | `FenwickTree` Loop Time | **Speedup Factor** |
-| :------------------ | :------------------------ | :---------------------- | :----------------- |
-| 100,000             | **~0.46 ms**              | ~1.77 ms                | **~3.9x faster**   |
-| 1,000,000           | **~0.52 ms**              | ~13.58 ms               | **~26.1x faster**  |
+---
 
-#### Fisher's Draw (Simultaneous Selections)
+#### Wallenius' Draw (Sequential Churn)
 
-Measures the time to select a batch of unique items (1% of the total population, e.g., k=1,000 for N=100,000). `DigitBinIndex` uses batched rejection sampling, optimized for efficiency.
+This benchmark simulates sequential selection by removing 100,000 items one-by-one, then adding 110,000 new items. This is a common pattern in agent-based models or iterative simulations. `DigitBinIndex`'s O(P) complexity gives it a decisive advantage as the population scales.
 
-| Scenario (N items, draw k) | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
-| :------------------------- | :------------------- | :----------------- | :----------------- |
-| N=100k, k=1k               | **~0.47 ms**         | ~1.87 ms           | **~4.0x faster**   |
-| N=1M, k=10k                | **~5.48 ms**         | ~20.16 ms          | **~3.7x faster**   |
+| Scenario (N items) | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
+| :------------------------- | :--------------------- | :----------------- | :----------------- |
+| **1 Million Items** (p=3)  | **~31.3 ms**           | ~81.4 ms           | **~2.6x faster**   |
+| **1 Million Items** (p=5)  | **~51.8 ms**           | ~79.6 ms           | **~1.5x faster**   |
+| **10 Million Items** (p=3) | **~661.6 ms**          | ~1727.7 ms         | **~2.6x faster**   |
 
-Higher precision settings slightly increase runtime but remain O(P), independent of N. Memory usage depends on the weight distribution and precision, with sparse distributions benefiting most from Roaring Bitmaps.
+*   **Key Takeaway**: `DigitBinIndex` is **over 2.6 times faster** than the `FenwickTree` for sequential operations on large datasets. Its performance is dependent on precision (`P`) and not the number of items (`N`), allowing it to scale far more effectively.
+
+---
+
+#### Fisher's Draw (Batch Churn)
+
+This benchmark simulates simultaneous selection by removing a large batch of 100,000 unique items at once, followed by the acquisition of 110,000 new items. `DigitBinIndex` uses a highly optimized batch rejection sampling method.
+
+| Scenario (N items) | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
+|:---|:---|:---|:---|
+| **1 Million Items** (p=3)  | **~23.3 ms**           | ~90.0 ms           | **~3.9x faster**   |
+| **1 Million Items** (p=5)  | **~45.0 ms**           | ~90.6 ms           | **~2.0x faster**   |
+| **10 Million Items** (p=3) | **~432.8 ms**          | ~1556.1 ms         | **~3.6x faster**   |
+
+**Key Takeaway**: For batch selections, `DigitBinIndex` is even more efficient, performing **up to 3.9 times faster**. The batched nature of the operation further highlights the architectural advantages of the radix tree approach for this use case.
 
 ---
 
@@ -61,10 +75,10 @@ Higher precision settings slightly increase runtime but remain O(P), independent
 
 Use `DigitBinIndex` when:
 
-* You need high-performance sampling for Wallenius' or Fisher's distributions.
-* Your dataset is large (N > 100,000).
-* Probabilities are approximate, as is common in empirical data, simulations, or machine learning models.
-* Performance is more critical than perfect precision.
+*   You need high-performance sampling for Wallenius' or Fisher's distributions.
+*   Your dataset is large (N > 100,000).
+*   Probabilities are approximate, as is common in empirical data, simulations, or machine learning models.
+*   Performance is more critical than perfect precision.
 
 Consider a Fenwick Tree if you require exact precision and your weights differ only at high decimal places (e.g., 0.12345 vs. 0.12346), though this comes at the cost of O(log N) complexity and higher memory usage for large datasets.
 
@@ -82,10 +96,10 @@ The `precision` parameter controls the radix tree's depth, balancing **accuracy*
 
 Each decimal place contributes exponentially less to a weight’s value. For a weight of `0.12345`:
 
-* 1st digit (`1`): `0.1`
-* 2nd digit (`2`): `0.02`
-* 3rd digit (`3`): `0.003`
-* 4th digit (`4`): `0.0004`
+*   1st digit (`1`): `0.1`
+*   2nd digit (`2`): `0.02`
+*   3rd digit (`3`): `0.003`
+*   4th digit (`4`): `0.0004`
 
 Truncating at 3 digits limits the error per item to <0.001. In large populations, these errors average out, minimally affecting the selection distribution.
 
@@ -123,8 +137,9 @@ def main():
     # With custom precision
     index_5 = DigitBinIndex.with_precision(5)
 
-    # With custom precision and capacity
-    index_3_XL = DigitBinIndex.with_precision_and_capacity(3, 10_000_000)
+    # With custom precision and capacity hint for large datasets
+    # This might choose a more memory-efficient internal storage.
+    index_3_xl = DigitBinIndex.with_precision_and_capacity(3, 10_000_000)
 
     # Add items with IDs and weights.
     index.add(id=101, weight=0.123)  # Low weight
@@ -136,14 +151,16 @@ def main():
     # Higher-weighted items (202, 303) are more likely.
     selected_item = index.select_and_remove()
     if selected_item:
-        print(f"Wallenius draw: ID {selected_item[0]}, Weight ~{selected_item[1]}")
+        # The returned weight is a float, representing the bin's average weight
+        item_id, weight = selected_item
+        print(f"Wallenius draw: ID {item_id}, Weight ~{weight:.3f}")
     
     print(f"Items remaining: {index.count()}")  # 3
 
     # Simultaneous (Fisher's) Draw: Select and remove 2 unique items.
-    selected_ids = index.select_many_and_remove(2)
-    if selected_ids:
-        print(f"Fisher's draw: {selected_ids}")
+    selected_items = index.select_many_and_remove(2)
+    if selected_items:
+        print(f"Fisher's draw: {selected_items}")
     
     print(f"Items remaining: {index.count()}")  # 1
 
@@ -157,26 +174,23 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-digit-bin-index = "0.2.5"    # Replace with the latest version from crates.io
-rust_decimal = "1.37"
-rust_decimal_macros = "1.37"  # Optional, for convenient decimal literals
+digit-bin-index = "0.3.0" # Replace with the latest version from crates.io
 ```
 
 Example usage:
 
 ```rust
 use digit_bin_index::DigitBinIndex;
-use rust_decimal_macros::dec;
 
 fn main() {
     // Create an index with precision 3.
     let mut index = DigitBinIndex::with_precision(3);
 
-    // Add items with IDs and weights.
-    index.add(101, dec!(0.123)); // Low weight
-    index.add(202, dec!(0.800)); // High weight
-    index.add(303, dec!(0.755)); // High weight
-    index.add(404, dec!(0.110)); // Low weight
+    // Add items with IDs and f64 weights.
+    index.add(101, 0.123); // Low weight
+    index.add(202, 0.800); // High weight
+    index.add(303, 0.755); // High weight
+    index.add(404, 0.110); // Low weight
 
     // Sequential (Wallenius') Draw: Select and remove one item.
     if let Some((id, weight)) = index.select_and_remove() {
@@ -185,8 +199,8 @@ fn main() {
     println!("Items remaining: {}", index.count()); // 3
 
     // Simultaneous (Fisher's) Draw: Select and remove 2 unique items.
-    if let Some(ids) = index.select_many_and_remove(2) {
-        println!("Fisher's draw: {:?}", ids);
+    if let Some(items) = index.select_many_and_remove(2) {
+        println!("Fisher's draw: {:?}", items);
     }
     println!("Items remaining: {}", index.count()); // 1
 }

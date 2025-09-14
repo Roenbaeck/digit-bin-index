@@ -1,6 +1,6 @@
 [package]
 name = "digit-bin-index"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2021"
 authors = ["Lars Rönnbäck <lars.ronnback@anchormodeling.com>"]
 license = "MIT"
@@ -11,9 +11,8 @@ keywords = ["statistics", "probability", "weighted-sampling", "simulation", "dat
 categories = ["data-structures", "algorithms", "science", "simulation"]
 
 [dependencies]
-rust_decimal = { version = "1.37", features = ["rand"] }
-rust_decimal_macros = "1.37"
-rand = "0.8" # Compatible with rust_decimal
+wyrand = "0.3"
+rand = "0.9" 
 roaring = "0.11"
 
 [dependencies.pyo3]
