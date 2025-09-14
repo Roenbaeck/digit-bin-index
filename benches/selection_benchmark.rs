@@ -150,15 +150,15 @@ impl WeightedSelector {
 }
 
 // --- Common benchmark parameters ---
-const INITIAL_POP: usize = 1_000_000;
-const CHURN_COUNT: usize = 100_000;
-const ACQUISITION_COUNT: usize = 110_000;
-const MAX_CAPACITY: usize = INITIAL_POP + ACQUISITION_COUNT;
+const INITIAL_POP: u64 = 1_000_000;
+const CHURN_COUNT: u64 = 100_000;
+const ACQUISITION_COUNT: u64 = 110_000;
+const MAX_CAPACITY: u64 = INITIAL_POP + ACQUISITION_COUNT;
 
-const VERY_LARGE_POP: usize = 10_000_000;
-const VERY_LARGE_CHURN: usize = 1_000_000;
-const VERY_LARGE_ACQ: usize = 1_000_000;
-const VERY_LARGE_MAX: usize = VERY_LARGE_POP + VERY_LARGE_ACQ;
+const VERY_LARGE_POP: u64 = 10_000_000;
+const VERY_LARGE_CHURN: u64 = 1_000_000;
+const VERY_LARGE_ACQ: u64 = 1_000_000;
+const VERY_LARGE_MAX: u64 = VERY_LARGE_POP + VERY_LARGE_ACQ;
 
 // --- Benchmarks (No changes needed here, the logic is identical) ---
 
@@ -183,7 +183,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("WeightedSelector (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut selector = WeightedSelector::new(MAX_CAPACITY);
+            let mut selector = WeightedSelector::new(MAX_CAPACITY as usize);
             let mut rng = WyRand::from_os_rng();
             for i in 0..INITIAL_POP { selector.add(i as u32, rng.random_range(0.001..0.999)).unwrap(); }
             (selector, INITIAL_POP as u32, rng)
@@ -213,7 +213,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("WeightedSelector (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut selector = WeightedSelector::new(MAX_CAPACITY);
+            let mut selector = WeightedSelector::new(MAX_CAPACITY as usize);
             let mut rng = WyRand::from_os_rng();
             for i in 0..INITIAL_POP { selector.add(i as u32, rng.random_range(0.00001..0.99999)).unwrap(); }
             (selector, INITIAL_POP as u32, rng)
@@ -247,7 +247,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("WeightedSelector (very large, FenwickTree)", VERY_LARGE_POP), |b| {
         b.iter_batched(|| {
-            let mut selector = WeightedSelector::new(VERY_LARGE_MAX);
+            let mut selector = WeightedSelector::new(VERY_LARGE_MAX as usize);
             let mut rng = WyRand::from_os_rng();
             for i in 0..VERY_LARGE_POP {
                 selector.add(i as u32, rng.random_range(0.001..0.999)).unwrap();
@@ -286,7 +286,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("WeightedSelector (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut selector = WeightedSelector::new(MAX_CAPACITY);
+            let mut selector = WeightedSelector::new(MAX_CAPACITY as usize);
             let mut rng = WyRand::from_os_rng();
             for i in 0..INITIAL_POP { selector.add(i as u32, rng.random_range(0.001..0.999)).unwrap(); }
             (selector, INITIAL_POP as u32, rng)
@@ -316,7 +316,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("WeightedSelector (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut selector = WeightedSelector::new(MAX_CAPACITY);
+            let mut selector = WeightedSelector::new(MAX_CAPACITY as usize);
             let mut rng = WyRand::from_os_rng();
             for i in 0..INITIAL_POP { selector.add(i as u32, rng.random_range(0.00001..0.99999)).unwrap(); }
             (selector, INITIAL_POP as u32, rng)
@@ -350,7 +350,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("WeightedSelector (very large, FenwickTree)", VERY_LARGE_POP), |b| {
         b.iter_batched(|| {
-            let mut selector = WeightedSelector::new(VERY_LARGE_MAX);
+            let mut selector = WeightedSelector::new(VERY_LARGE_MAX as usize);
             let mut rng = WyRand::from_os_rng();
             for i in 0..VERY_LARGE_POP {
                 selector.add(i as u32, rng.random_range(0.001..0.999)).unwrap();
