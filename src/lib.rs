@@ -67,7 +67,7 @@ impl DigitBin for RoaringBitmap {
         if self.is_empty() { None } else {
             let idx = rng.random_range(0..self.len() as u32);
             let selected = self.select(idx);
-            self.remove(idx);
+            self.remove(selected.unwrap());
             selected
         }
     }
@@ -1045,32 +1045,28 @@ mod python {
             self.index.remove(id, weight);
         }
 
-        fn select(&mut self) -> Option<(u32, String)> {
-            self.index.select().map(|(id, weight)| (id, weight.to_string()))
+        fn select(&mut self) -> Option<(u32, f64)> {
+            self.index.select()
         }
 
-        fn select_many(&mut self, n: u32) -> Option<Vec<(u32, String)>> {
-            self.index.select_many(n).map(|items| {
-                items.into_iter().map(|(id, w)| (id, w.to_string())).collect()
-            })
+        fn select_many(&mut self, n: u32) -> Option<Vec<(u32, f64)>> {
+            self.index.select_many(n)
         }
 
-        fn select_and_remove(&mut self) -> Option<(u32, String)> {
-            self.index.select_and_remove().map(|(id, weight)| (id, weight.to_string()))
+        fn select_and_remove(&mut self) -> Option<(u32, f64)> {
+            self.index.select_and_remove()
         }
 
-        fn select_many_and_remove(&mut self, n: u32) -> Option<Vec<(u32, String)>> {
-            self.index.select_many_and_remove(n).map(|items| {
-                items.into_iter().map(|(id, w)| (id, w.to_string())).collect()
-            })
+        fn select_many_and_remove(&mut self, n: u32) -> Option<Vec<(u32, f64)>> {
+            self.index.select_many_and_remove(n)
+        }
+
+        fn total_weight(&self) -> f64 {
+            self.index.total_weight()
         }
 
         fn count(&self) -> u32 {
             self.index.count()
-        }
-
-        fn total_weight(&self) -> String {
-            self.index.total_weight().to_string()
         }
     }
 
