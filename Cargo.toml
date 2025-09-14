@@ -11,10 +11,8 @@ keywords = ["statistics", "probability", "weighted-sampling", "simulation", "dat
 categories = ["data-structures", "algorithms", "science", "simulation"]
 
 [dependencies]
-rust_decimal = { version = "1.37", features = ["rand"] }
-rust_decimal_macros = "1.37"
-wyrand = "0.2"
-rand = "0.8" # Compatible with rust_decimal
+wyrand = "0.3"
+rand = "0.9" 
 roaring = "0.11"
 
 [dependencies.pyo3]
