@@ -113,6 +113,12 @@ Truncating at 3 digits limits the error per item to <0.001. In large populations
 
 ---
 
+## Maximum Item Capacity for `DigitBinIndex`
+
+Since the identities used for individuals are u32, the current implementation limits the maxiumum capacity to 2^32 - 1 ≈ 4.29 billion.
+
+---
+
 ### Usage & Installation
 
 `DigitBinIndex` is available as a Python library on [PyPI](https://pypi.org/project/digit-bin-index/) or as a Rust crate on [Crates.io](https://crates.io/crates/digit-bin-index). Ensure Python 3.6+ for Python bindings or Rust 1.75+ for the Rust crate.

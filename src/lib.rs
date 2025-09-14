@@ -8,7 +8,7 @@
 //! noncentral hypergeometric distribution.
 
 use wyrand::WyRand;
-use rand::{Rng, SeedableRng}; 
+use rand::{distr::{Distribution, Uniform}, Rng, SeedableRng}; 
 use roaring::RoaringBitmap;
 use std::vec;
 
@@ -88,7 +88,7 @@ pub struct Node<B: DigitBin> {
     /// The content of this node, either more nodes or a list of individual IDs.
     pub content: NodeContent<B>,
     /// The total sum of scaled values stored under this node.
-    pub accumulated_value: u128,
+    pub accumulated_value: u64,
     /// The total count of individuals stored under this node.
     pub content_count: u32,
 }
@@ -98,7 +98,7 @@ impl<B: DigitBin> Node<B> {
     fn new_internal() -> Self {
         Self {
             content: NodeContent::DigitIndex(vec![]), 
-            accumulated_value: 0u128,
+            accumulated_value: 0u64,
             content_count: 0,
         }
     }
@@ -559,7 +559,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         max_depth: u8,
     ) {
         node.content_count += 1;
-        node.accumulated_value += scaled as u128;
+        node.accumulated_value += scaled;
 
         if current_depth > max_depth {
             if let NodeContent::DigitIndex(_) = &node.content {
@@ -601,7 +601,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
                 bin.remove(individual_id);
                 if bin.len() < orig_len {
                     node.content_count -= 1;
-                    node.accumulated_value -= scaled as u128;
+                    node.accumulated_value -= scaled;
                     return true;
                 }
             }
@@ -612,7 +612,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         if let NodeContent::DigitIndex(children) = &mut node.content {
             if children.len() > digit && Self::remove_recurse(&mut children[digit], individual_id, scaled, digits, current_depth + 1, max_depth) {
                 node.content_count -= 1;
-                node.accumulated_value -= scaled as u128;
+                node.accumulated_value -= scaled;
                 return true;
             }
         }
@@ -640,14 +640,14 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
             return None;
         }
         let mut rng = WyRand::from_os_rng();
-        let random_target = rng.random_range(0u128..self.root.accumulated_value);
+        let random_target = rng.random_range(0u64..self.root.accumulated_value);
         Self::select_and_optionally_remove_recurse(&mut self.root, random_target, 1, self.precision, &mut rng, with_removal, self.scale)
     }
 
     // Helper function
     fn select_and_optionally_remove_recurse(
         node: &mut Node<B>,
-        target: u128,
+        target: u64,
         current_depth: u8,
         max_depth: u8,
         rng: &mut WyRand,
@@ -660,7 +660,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
                 if bin.is_empty() {
                     return None;
                 }
-                let scaled_weight = node.accumulated_value / node.content_count as u128;
+                let scaled_weight = node.accumulated_value / node.content_count as u64;
                 let weight = scaled_weight as f64 / scale;
                 let selected_id = if with_removal {
                     bin.get_random_and_remove(rng)?
@@ -678,7 +678,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
 
         // Recursive case: DigitIndex node
         if let NodeContent::DigitIndex(children) = &mut node.content {
-            let mut cum: u128 = 0;
+            let mut cum: u64 = 0;
             for child in children.iter_mut() {
                 if child.accumulated_value == 0 {
                     continue;
@@ -695,7 +695,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
                     ) {
                         if with_removal {
                             node.content_count -= 1;
-                            node.accumulated_value -= (weight * scale).round() as u128;
+                            node.accumulated_value -= (weight * scale).round() as u64;
                         }
                         return Some((selected_id, weight));
                     }
@@ -719,11 +719,13 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         let mut rng = WyRand::from_os_rng();
         let mut selected = Vec::with_capacity(num_to_draw as usize);
         let total_accum = self.root.accumulated_value;
-        // Generate initial random targets for the root
-        let passed_targets: Vec<u128> = (0..num_to_draw)
-            .map(|_| rng.random_range(0u128..total_accum))
+        // Create a Uniform distribution for the range [0, total_accum)
+        let uniform = Uniform::new(0u64, total_accum).expect("Valid range for Uniform");  
+        // Generate num_to_draw random numbers using sample_iter
+        let passed_targets: Vec<u64> = uniform
+            .sample_iter(&mut rng)
+            .take(num_to_draw as usize)
             .collect();
-        // Call with pre-generated targets
         Self::select_many_and_optionally_remove_recurse(
             &mut self.root,
             total_accum,
@@ -754,13 +756,13 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
     /// - scale: The scaling factor for weight conversions.
     fn select_many_and_optionally_remove_recurse(
         node: &mut Node<B>,
-        subtree_total: u128,
+        subtree_total: u64,
         selected: &mut Vec<(u32, f64)>,
         rng: &mut WyRand,
         current_depth: u8,
         precision: u8,
         with_removal: bool,
-        passed_targets: Vec<u128>,
+        passed_targets: Vec<u64>,
         scale: f64,
     ) {
         let original_target_count = passed_targets.len() as u32;
@@ -771,9 +773,9 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         if current_depth > precision {
             if let NodeContent::Bin(bin) = &mut node.content {
                 let bin_scaled = if node.content_count > 0 {
-                    node.accumulated_value / node.content_count as u128
+                    node.accumulated_value / node.content_count as u64
                 } else {
-                    0u128
+                    0u64
                 };
                 let bin_weight = bin_scaled as f64 / scale;
                 let to_select = original_target_count.min(node.content_count);
@@ -790,7 +792,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
                 }
                 if with_removal {
                     node.content_count -= picked;
-                    node.accumulated_value -= bin_scaled * picked as u128;
+                    node.accumulated_value -= bin_scaled * picked as u64;
                 }
             }
             return;
@@ -799,11 +801,11 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         // DigitIndex node: Assign to children using passed_targets first, with rejection.
         if let NodeContent::DigitIndex(children) = &mut node.content {
             let mut child_assigned = vec![0u32; children.len()];
-            let mut child_rel_targets: Vec<Vec<u128>> = vec![Vec::new(); children.len()];
+            let mut child_rel_targets: Vec<Vec<u64>> = vec![Vec::new(); children.len()];
             let mut assigned = 0u32;
 
             for target in passed_targets {
-                let mut cum: u128 = 0;
+                let mut cum: u64 = 0;
                 let mut chosen_idx = None;
                 for (i, child) in children.iter().enumerate() {
                     if child.accumulated_value == 0 {
@@ -831,8 +833,8 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
             let remaining = original_target_count - assigned;
             let mut additional_assigned = 0u32;
             while additional_assigned < remaining {
-                let target = rng.random_range(0u128..subtree_total);
-                let mut cum: u128 = 0;
+                let target = rng.random_range(0u64..subtree_total);
+                let mut cum: u64 = 0;
                 let mut chosen_idx = None;
                 for (i, child) in children.iter().enumerate() {
                     if child.accumulated_value == 0 {
@@ -857,7 +859,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
             }
 
             // Store accumulated values to avoid immutable borrow during iteration
-            let child_accums: Vec<u128> = children.iter().map(|c| c.accumulated_value).collect();
+            let child_accums: Vec<u64> = children.iter().map(|c| c.accumulated_value).collect();
 
             // Recurse into each child with assigned > 0, passing rel_targets
             for (i, child) in children.iter_mut().enumerate() {
@@ -941,7 +943,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
                     stats.max_bin_size = Some(stats.max_bin_size.map_or(bin_size, |max| max.max(bin_size)));
 
                     if bin_size > 0 {
-                        let scaled_avg = node.accumulated_value / node.content_count as u128;
+                        let scaled_avg = node.accumulated_value / node.content_count as u64;
                         let weight = scaled_avg as f64 / scale;
                         stats.min_weight = Some(stats.min_weight.map_or(weight, |min| min.min(weight)));
                         stats.max_weight = Some(stats.max_weight.map_or(weight, |max| max.max(weight)));
