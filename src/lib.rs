@@ -145,8 +145,9 @@ impl<B: DigitBin> Node<B> {
 /// ```
 #[derive(Debug, Clone)]
 pub enum DigitBinIndex {
-    Vec(DigitBinIndexGeneric<Vec<u32>>),
-    Roaring(DigitBinIndexGeneric<RoaringBitmap>),
+    Small(DigitBinIndexGeneric<Vec<u32>>),
+    Medium(DigitBinIndexGeneric<RoaringBitmap>),
+    Large(DigitBinIndexGeneric<RoaringTreemap>),
 }
 
 impl DigitBinIndex {
@@ -174,14 +175,18 @@ impl DigitBinIndex {
     /// let index = DigitBinIndex::with_precision_and_capacity(3, 100);
     /// // Uses Vec<u32> because capacity is small
     /// ```
-    pub fn with_precision_and_capacity(precision: u8, capacity: usize) -> Self {
-        // Heuristic: Use RoaringBitmap if average bin size (capacity / 10^precision) exceeds threshold
-        let threshold = 1000;
-        let max_bins = 10usize.pow(precision as u32);
-        if capacity / max_bins > threshold {
-            DigitBinIndex::Roaring(DigitBinIndexGeneric::<RoaringBitmap>::with_precision(precision))
+    pub fn with_precision_and_capacity(precision: u8, capacity: u64) -> Self {
+        let max_bins = 10u64.pow(precision as u32);
+        if capacity / max_bins > 1_000_000_000 {
+            // Heuristic: Use RoaringTreemap if average bin size (capacity / 10^precision) exceeds threshold
+            DigitBinIndex::Large(DigitBinIndexGeneric::<RoaringTreemap>::with_precision(precision))
+        }
+        else if capacity / max_bins > 1_000 {
+            // Heuristic: Use RoaringBitmap if average bin size (capacity / 10^precision) exceeds threshold
+            DigitBinIndex::Medium(DigitBinIndexGeneric::<RoaringBitmap>::with_precision(precision))
         } else {
-            DigitBinIndex::Vec(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
+            // Heuristic: Use Vec<u32> for small average bin sizes
+            DigitBinIndex::Small(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
         }
     }
 
@@ -204,7 +209,7 @@ impl DigitBinIndex {
     /// assert_eq!(index.precision(), 3);
     /// ```    
     pub fn new() -> Self {
-        DigitBinIndex::Vec(DigitBinIndexGeneric::<Vec<u32>>::new())
+        DigitBinIndex::Small(DigitBinIndexGeneric::<Vec<u32>>::new())
     }
 
     /// Creates a new `DigitBinIndex` instance with the specified precision.
@@ -234,7 +239,7 @@ impl DigitBinIndex {
     /// assert_eq!(index.precision(), 4);
     /// ```
     pub fn with_precision(precision: u8) -> Self {
-        DigitBinIndex::Vec(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
+        DigitBinIndex::Small(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
     }
 
     /// Adds an item with the given ID and weight to the index.
@@ -263,8 +268,9 @@ impl DigitBinIndex {
     /// ```    
     pub fn add(&mut self, id: u64, weight: f64) -> bool {
         match self {
-            DigitBinIndex::Vec(index) => index.add(id, weight),
-            DigitBinIndex::Roaring(index) => index.add(id, weight),
+            DigitBinIndex::Small(index) => index.add(id, weight),
+            DigitBinIndex::Medium(index) => index.add(id, weight),
+            DigitBinIndex::Large(index) => index.add(id, weight),
         }
     }
 
@@ -290,8 +296,9 @@ impl DigitBinIndex {
     /// ```
     pub fn remove(&mut self, id: u64, weight: f64) {
         match self {
-            DigitBinIndex::Vec(index) => index.remove(id, weight),
-            DigitBinIndex::Roaring(index) => index.remove(id, weight),
+            DigitBinIndex::Small(index) => index.remove(id, weight),
+            DigitBinIndex::Medium(index) => index.remove(id, weight),
+            DigitBinIndex::Large(index) => index.remove(id, weight),
         }
     }
 
@@ -317,8 +324,9 @@ impl DigitBinIndex {
     /// ```
     pub fn select(&mut self) -> Option<(u64, f64)> {
         match self {
-            DigitBinIndex::Vec(index) => index.select(),
-            DigitBinIndex::Roaring(index) => index.select(),
+            DigitBinIndex::Small(index) => index.select(),
+            DigitBinIndex::Medium(index) => index.select(),
+            DigitBinIndex::Large(index) => index.select(),
         }
     }
 
@@ -344,8 +352,9 @@ impl DigitBinIndex {
     /// ```
     pub fn select_and_remove(&mut self) -> Option<(u64, f64)> {
         match self {
-            DigitBinIndex::Vec(index) => index.select_and_remove(),
-            DigitBinIndex::Roaring(index) => index.select_and_remove(),
+            DigitBinIndex::Small(index) => index.select_and_remove(),
+            DigitBinIndex::Medium(index) => index.select_and_remove(),
+            DigitBinIndex::Large(index) => index.select_and_remove(),
         }
     }
 
@@ -376,8 +385,9 @@ impl DigitBinIndex {
     /// ```
     pub fn select_many(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
         match self {
-            DigitBinIndex::Vec(index) => index.select_many(num_to_draw),
-            DigitBinIndex::Roaring(index) => index.select_many(num_to_draw),
+            DigitBinIndex::Small(index) => index.select_many(num_to_draw),
+            DigitBinIndex::Medium(index) => index.select_many(num_to_draw),
+            DigitBinIndex::Large(index) => index.select_many(num_to_draw),
         }
     }
 
@@ -408,8 +418,9 @@ impl DigitBinIndex {
     /// ```
     pub fn select_many_and_remove(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
         match self {
-            DigitBinIndex::Vec(index) => index.select_many_and_remove(num_to_draw),
-            DigitBinIndex::Roaring(index) => index.select_many_and_remove(num_to_draw),
+            DigitBinIndex::Small(index) => index.select_many_and_remove(num_to_draw),
+            DigitBinIndex::Medium(index) => index.select_many_and_remove(num_to_draw),
+            DigitBinIndex::Large(index) => index.select_many_and_remove(num_to_draw),
         }
     }
 
@@ -429,8 +440,9 @@ impl DigitBinIndex {
     /// ```
     pub fn count(&self) -> u64 {
         match self {
-            DigitBinIndex::Vec(index) => index.count(),
-            DigitBinIndex::Roaring(index) => index.count(),
+            DigitBinIndex::Small(index) => index.count(),
+            DigitBinIndex::Medium(index) => index.count(),
+            DigitBinIndex::Large(index) => index.count(),
         }
     }
 
@@ -453,24 +465,27 @@ impl DigitBinIndex {
     /// ```
     pub fn total_weight(&self) -> f64 {
         match self {
-            DigitBinIndex::Vec(index) => index.total_weight(),
-            DigitBinIndex::Roaring(index) => index.total_weight(),
+            DigitBinIndex::Small(index) => index.total_weight(),
+            DigitBinIndex::Medium(index) => index.total_weight(),
+            DigitBinIndex::Large(index) => index.total_weight(),
         }
     }
 
     /// Prints statistics about the underlying tree.
     pub fn print_stats(&self) {
         match self {
-            DigitBinIndex::Vec(idx) => idx.print_stats(),
-            DigitBinIndex::Roaring(idx) => idx.print_stats(),
+            DigitBinIndex::Small(idx) => idx.print_stats(),
+            DigitBinIndex::Medium(idx) => idx.print_stats(),
+            DigitBinIndex::Large(idx) => idx.print_stats(),
         }
     }    
 
     /// Returns the precision (number of decimal places) used for binning.
     pub fn precision(&self) -> u8 {
         match self {
-            DigitBinIndex::Vec(idx) => idx.precision,
-            DigitBinIndex::Roaring(idx) => idx.precision,
+            DigitBinIndex::Small(idx) => idx.precision,
+            DigitBinIndex::Medium(idx) => idx.precision,
+            DigitBinIndex::Large(idx) => idx.precision,
         }
     }    
 }
@@ -1047,7 +1062,7 @@ mod python {
 
         /// Create a DigitBinIndex with a specific precision.
         #[staticmethod]
-        fn with_precision(precision: u32) -> Self {
+        fn with_precision(precision: u64) -> Self {
             PyDigitBinIndex {
                 index: DigitBinIndex::with_precision(precision.try_into().unwrap()),
             }
@@ -1055,33 +1070,33 @@ mod python {
 
         /// Create a DigitBinIndex with a specific precision and expected capacity.
         #[staticmethod]
-        fn with_precision_and_capacity(precision: u32, capacity: usize) -> Self {
+        fn with_precision_and_capacity(precision: u8, capacity: u64) -> Self {
             PyDigitBinIndex {
-                index: DigitBinIndex::with_precision_and_capacity(precision.try_into().unwrap(), capacity),
+                index: DigitBinIndex::with_precision_and_capacity(precision, capacity),
             }
         }        
 
-        fn add(&mut self, id: u32, weight: f64) -> bool {
+        fn add(&mut self, id: u64, weight: f64) -> bool {
             self.index.add(id, weight)
         }
 
-        fn remove(&mut self, id: u32, weight: f64) {
+        fn remove(&mut self, id: u64, weight: f64) {
             self.index.remove(id, weight);
         }
 
-        fn select(&mut self) -> Option<(u32, f64)> {
+        fn select(&mut self) -> Option<(u64, f64)> {
             self.index.select()
         }
 
-        fn select_many(&mut self, n: u32) -> Option<Vec<(u32, f64)>> {
+        fn select_many(&mut self, n: u64) -> Option<Vec<(u64, f64)>> {
             self.index.select_many(n)
         }
 
-        fn select_and_remove(&mut self) -> Option<(u32, f64)> {
+        fn select_and_remove(&mut self) -> Option<(u64, f64)> {
             self.index.select_and_remove()
         }
 
-        fn select_many_and_remove(&mut self, n: u32) -> Option<Vec<(u32, f64)>> {
+        fn select_many_and_remove(&mut self, n: u64) -> Option<Vec<(u64, f64)>> {
             self.index.select_many_and_remove(n)
         }
 
@@ -1089,7 +1104,7 @@ mod python {
             self.index.total_weight()
         }
 
-        fn count(&self) -> u32 {
+        fn count(&self) -> u64 {
             self.index.count()
         }
     }
@@ -1149,7 +1164,7 @@ mod tests {
         let mut total_high_risk_selected = 0;
 
         for _ in 0..NUM_SIMULATIONS {
-            let mut index = DigitBinIndex::with_precision_and_capacity(3, TOTAL_ITEMS as usize);
+            let mut index = DigitBinIndex::with_precision_and_capacity(3, TOTAL_ITEMS);
             for i in 0..ITEMS_PER_GROUP { index.add(i, low_risk_weight); }
             for i in ITEMS_PER_GROUP..TOTAL_ITEMS { index.add(i, high_risk_weight); }
 
@@ -1210,7 +1225,7 @@ mod tests {
         let mut total_high_risk_selected = 0;
 
         for _ in 0..NUM_SIMULATIONS {
-            let mut index = DigitBinIndex::with_precision_and_capacity(3, TOTAL_ITEMS as usize);
+            let mut index = DigitBinIndex::with_precision_and_capacity(3, TOTAL_ITEMS);
             for i in 0..ITEMS_PER_GROUP { index.add(i, low_risk_weight); }
             for i in ITEMS_PER_GROUP..TOTAL_ITEMS { index.add(i, high_risk_weight); }
             
@@ -1262,3 +1277,14 @@ fn test_weight_to_digits() {
     // Test overflow (though unlikely for weights <1, but for completeness)
     assert!(index.weight_to_digits(2.0).is_none()); // Should trigger temp != 0 check
 }
+
+#[cfg(test)]
+#[test]
+fn test_treemap() {
+    let mut index = DigitBinIndex::with_precision_and_capacity(3, 1_000_000_000_000);
+    for i in 0..1_000_000_000 {
+        index.add(i, 0.1);
+    }
+    index.select_many_and_remove(1_000_000); 
+}
+
