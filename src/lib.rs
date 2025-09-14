@@ -9,7 +9,7 @@
 
 use wyrand::WyRand;
 use rand::{distr::{Distribution, Uniform}, Rng, SeedableRng}; 
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use std::vec;
 
 // The default precision to use if none is specified in the constructor.
@@ -21,18 +21,18 @@ const MAX_PRECISION: usize = 9;
 /// Implement this trait for any container you want to use for storing IDs in the leaf nodes.
 /// Provided implementations: [`Vec<u32>`], [`RoaringBitmap`].
 pub trait DigitBin: Clone + Default {
-    fn insert(&mut self, id: u32);
-    fn remove(&mut self, id: u32) -> bool;
+    fn insert(&mut self, id: u64);
+    fn remove(&mut self, id: u64) -> bool;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
-    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u32>;
-    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u32>;
+    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u64>;
+    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u64>;
 }
 
 impl DigitBin for Vec<u32> {
-    fn insert(&mut self, id: u32) { self.push(id); }
-    fn remove(&mut self, id: u32) -> bool {
-        if let Some(pos) = self.iter().position(|&x| x == id) {
+    fn insert(&mut self, id: u64) { self.push(id as u32); }
+    fn remove(&mut self, id: u64) -> bool {
+        if let Some(pos) = self.iter().position(|&x| x == id as u32) {
             self.swap_remove(pos);
             true
         } else {
@@ -41,37 +41,59 @@ impl DigitBin for Vec<u32> {
     }
     fn len(&self) -> usize { self.len() }
     fn is_empty(&self) -> bool { self.is_empty() }
-    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u32> {
-        if self.is_empty() { None } else { Some(self[rng.random_range(0..self.len())]) }
+    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u64> {
+        if self.is_empty() { None } else { Some(self[rng.random_range(0..self.len())] as u64) }
     }
-    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u32> {
+    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u64> {
         if self.is_empty() { None } else {
             let pos = rng.random_range(0..self.len());
-            Some(self.swap_remove(pos))
+            Some(self.swap_remove(pos) as u64)
         }
     }
 }
 
 impl DigitBin for RoaringBitmap {
-    fn insert(&mut self, id: u32) { self.insert(id); }
-    fn remove(&mut self, id: u32) -> bool { self.remove(id) }
+    fn insert(&mut self, id: u64) { self.insert(id as u32); }
+    fn remove(&mut self, id: u64) -> bool { self.remove(id as u32) }
     fn len(&self) -> usize { self.len() as usize }
     fn is_empty(&self) -> bool { self.is_empty() }
-    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u32> {
+    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u64> {
         if self.is_empty() { None } else {
             let idx = rng.random_range(0..self.len() as u32);
+            self.select(idx).map(|v| v as u64)
+        }
+    }
+    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u64> {
+        if self.is_empty() { None } else {
+            let idx = rng.random_range(0..self.len() as u32);
+            let selected = self.select(idx);
+            self.remove(selected.unwrap());
+            selected.map(|v| v as u64)
+        }
+    }
+}
+
+impl DigitBin for RoaringTreemap {
+    fn insert(&mut self, id: u64) { self.insert(id); }
+    fn remove(&mut self, id: u64) -> bool { self.remove(id) }
+    fn len(&self) -> usize { self.len() as usize }
+    fn is_empty(&self) -> bool { self.is_empty() }
+    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u64> {
+        if self.is_empty() { None } else {
+            let idx = rng.random_range(0..self.len() as u64);
             self.select(idx)
         }
     }
-    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u32> {
+    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u64> {
         if self.is_empty() { None } else {
-            let idx = rng.random_range(0..self.len() as u32);
+            let idx = rng.random_range(0..self.len());
             let selected = self.select(idx);
             self.remove(selected.unwrap());
             selected
         }
     }
 }
+
 
 /// The content of a node, which is either more nodes or a leaf with individuals.
 #[derive(Debug, Clone)]
@@ -90,7 +112,7 @@ pub struct Node<B: DigitBin> {
     /// The total sum of scaled values stored under this node.
     pub accumulated_value: u64,
     /// The total count of individuals stored under this node.
-    pub content_count: u32,
+    pub content_count: u64,
 }
 
 impl<B: DigitBin> Node<B> {
@@ -239,7 +261,7 @@ impl DigitBinIndex {
     /// assert!(added);
     /// assert_eq!(index.count(), 1);
     /// ```    
-    pub fn add(&mut self, id: u32, weight: f64) -> bool {
+    pub fn add(&mut self, id: u64, weight: f64) -> bool {
         match self {
             DigitBinIndex::Vec(index) => index.add(id, weight),
             DigitBinIndex::Roaring(index) => index.add(id, weight),
@@ -266,7 +288,7 @@ impl DigitBinIndex {
     /// index.remove(1, 0.5);
     /// assert_eq!(index.count(), 0);
     /// ```
-    pub fn remove(&mut self, id: u32, weight: f64) {
+    pub fn remove(&mut self, id: u64, weight: f64) {
         match self {
             DigitBinIndex::Vec(index) => index.remove(id, weight),
             DigitBinIndex::Roaring(index) => index.remove(id, weight),
@@ -293,7 +315,7 @@ impl DigitBinIndex {
     ///     assert_eq!(weight, 0.5);
     /// }
     /// ```
-    pub fn select(&mut self) -> Option<(u32, f64)> {
+    pub fn select(&mut self) -> Option<(u64, f64)> {
         match self {
             DigitBinIndex::Vec(index) => index.select(),
             DigitBinIndex::Roaring(index) => index.select(),
@@ -320,7 +342,7 @@ impl DigitBinIndex {
     /// }
     /// assert_eq!(index.count(), 0);
     /// ```
-    pub fn select_and_remove(&mut self) -> Option<(u32, f64)> {
+    pub fn select_and_remove(&mut self) -> Option<(u64, f64)> {
         match self {
             DigitBinIndex::Vec(index) => index.select_and_remove(),
             DigitBinIndex::Roaring(index) => index.select_and_remove(),
@@ -352,7 +374,7 @@ impl DigitBinIndex {
     ///     assert_eq!(selected.len(), 2);
     /// }
     /// ```
-    pub fn select_many(&mut self, num_to_draw: u32) -> Option<Vec<(u32, f64)>> {
+    pub fn select_many(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
         match self {
             DigitBinIndex::Vec(index) => index.select_many(num_to_draw),
             DigitBinIndex::Roaring(index) => index.select_many(num_to_draw),
@@ -384,7 +406,7 @@ impl DigitBinIndex {
     /// }
     /// assert_eq!(index.count(), 0);
     /// ```
-    pub fn select_many_and_remove(&mut self, num_to_draw: u32) -> Option<Vec<(u32, f64)>> {
+    pub fn select_many_and_remove(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
         match self {
             DigitBinIndex::Vec(index) => index.select_many_and_remove(num_to_draw),
             DigitBinIndex::Roaring(index) => index.select_many_and_remove(num_to_draw),
@@ -405,7 +427,7 @@ impl DigitBinIndex {
     /// let mut index = DigitBinIndex::new();
     /// assert_eq!(index.count(), 0);
     /// ```
-    pub fn count(&self) -> u32 {
+    pub fn count(&self) -> u64 {
         match self {
             DigitBinIndex::Vec(index) => index.count(),
             DigitBinIndex::Roaring(index) => index.count(),
@@ -540,7 +562,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
 
     // --- Standard Functions ---
 
-    pub fn add(&mut self, individual_id: u32, weight: f64) -> bool {
+    pub fn add(&mut self, individual_id: u64, weight: f64) -> bool {
         if let Some((digits, scaled)) = self.weight_to_digits(weight) {
             Self::add_recurse(&mut self.root, individual_id, scaled, &digits, 1, self.precision);
             true
@@ -552,7 +574,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
     /// Recursive private method to handle adding individuals.
     fn add_recurse(
         node: &mut Node<B>,
-        individual_id: u32,
+        individual_id: u64,
         scaled: u64, // Scaled weight as u64
         digits: &[u8; MAX_PRECISION],
         current_depth: u8,
@@ -580,7 +602,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         }
     }
 
-    pub fn remove(&mut self, individual_id: u32, weight: f64) {
+    pub fn remove(&mut self, individual_id: u64, weight: f64) {
         if let Some((digits, scaled)) = self.weight_to_digits(weight) {
             Self::remove_recurse(&mut self.root, individual_id, scaled, &digits, 1, self.precision);
         }
@@ -589,7 +611,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
     /// Recursive private method to handle removing individuals.
     fn remove_recurse(
         node: &mut Node<B>,
-        individual_id: u32,
+        individual_id: u64,
         scaled: u64,
         digits: &[u8; MAX_PRECISION],
         current_depth: u8,
@@ -622,20 +644,20 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
 
     // --- Selection Functions ---
 
-    pub fn select(&mut self) -> Option<(u32, f64)> {
+    pub fn select(&mut self) -> Option<(u64, f64)> {
         self.select_and_optionally_remove(false)
     }
 
-    pub fn select_many(&mut self, num_to_draw: u32) -> Option<Vec<(u32, f64)>> {
+    pub fn select_many(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
         self.select_many_and_optionally_remove(num_to_draw, false)
     }
 
-    pub fn select_and_remove(&mut self) -> Option<(u32, f64)> {
+    pub fn select_and_remove(&mut self) -> Option<(u64, f64)> {
         self.select_and_optionally_remove(true)
     }
 
     // Wrapper function to handle both select and select_and_remove
-    pub fn select_and_optionally_remove(&mut self, with_removal: bool) -> Option<(u32, f64)> {
+    pub fn select_and_optionally_remove(&mut self, with_removal: bool) -> Option<(u64, f64)> {
         if self.root.content_count == 0 {
             return None;
         }
@@ -653,7 +675,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         rng: &mut WyRand,
         with_removal: bool,
         scale: f64,
-    ) -> Option<(u32, f64)> {
+    ) -> Option<(u64, f64)> {
         // Base case: Bin node
         if current_depth > max_depth {
             if let NodeContent::Bin(bin) = &mut node.content {
@@ -707,17 +729,17 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         None
     } 
 
-    pub fn select_many_and_remove(&mut self, num_to_draw: u32) -> Option<Vec<(u32, f64)>> {
+    pub fn select_many_and_remove(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
         self.select_many_and_optionally_remove(num_to_draw, true)
     }
 
     // Wrapper function to handle both select_many and select_many_and_remove
-    pub fn select_many_and_optionally_remove(&mut self, num_to_draw: u32, with_removal: bool) -> Option<Vec<(u32, f64)>> {
+    pub fn select_many_and_optionally_remove(&mut self, num_to_draw: u64, with_removal: bool) -> Option<Vec<(u64, f64)>> {
         if num_to_draw > self.count() || num_to_draw == 0 {
             return if num_to_draw == 0 { Some(Vec::new()) } else { None };
         }
         let mut rng = WyRand::from_os_rng();
-        let mut selected = Vec::with_capacity(num_to_draw as usize);
+        let mut selected: Vec<(u64, f64)> = Vec::with_capacity(num_to_draw as usize);
         let total_accum = self.root.accumulated_value;
         // Create a Uniform distribution for the range [0, total_accum)
         let uniform = Uniform::new(0u64, total_accum).expect("Valid range for Uniform");  
@@ -757,7 +779,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
     fn select_many_and_optionally_remove_recurse(
         node: &mut Node<B>,
         subtree_total: u64,
-        selected: &mut Vec<(u32, f64)>,
+        selected: &mut Vec<(u64, f64)>,
         rng: &mut WyRand,
         current_depth: u8,
         precision: u8,
@@ -765,7 +787,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         passed_targets: Vec<u64>,
         scale: f64,
     ) {
-        let original_target_count = passed_targets.len() as u32;
+        let original_target_count = passed_targets.len() as u64;
         if original_target_count == 0 {
             return;
         }
@@ -779,7 +801,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
                 };
                 let bin_weight = bin_scaled as f64 / scale;
                 let to_select = original_target_count.min(node.content_count);
-                let mut picked = 0u32;
+                let mut picked = 0u64;
                 while picked < to_select && !bin.is_empty() {
                     if with_removal {
                         let id = bin.get_random_and_remove(rng).unwrap();
@@ -800,9 +822,9 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
 
         // DigitIndex node: Assign to children using passed_targets first, with rejection.
         if let NodeContent::DigitIndex(children) = &mut node.content {
-            let mut child_assigned = vec![0u32; children.len()];
+            let mut child_assigned = vec![0u64; children.len()];
             let mut child_rel_targets: Vec<Vec<u64>> = vec![Vec::new(); children.len()];
-            let mut assigned = 0u32;
+            let mut assigned = 0u64;
 
             for target in passed_targets {
                 let mut cum: u64 = 0;
@@ -831,7 +853,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
 
             // Generate additional targets for any rejected ones
             let remaining = original_target_count - assigned;
-            let mut additional_assigned = 0u32;
+            let mut additional_assigned = 0u64;
             while additional_assigned < remaining {
                 let target = rng.random_range(0u64..subtree_total);
                 let mut cum: u64 = 0;
@@ -888,7 +910,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         }
     }
 
-    pub fn count(&self) -> u32 {
+    pub fn count(&self) -> u64 {
         self.root.content_count
     }
 
@@ -1115,9 +1137,9 @@ mod tests {
     #[test]
     fn test_wallenius_distribution_is_correct() {
         // --- Setup: Create a controlled population ---
-        const ITEMS_PER_GROUP: u32 = 1000;
-        const TOTAL_ITEMS: u32 = ITEMS_PER_GROUP * 2;
-        const NUM_DRAWS: u32 = TOTAL_ITEMS / 2;
+        const ITEMS_PER_GROUP: u64 = 1000;
+        const TOTAL_ITEMS: u64 = ITEMS_PER_GROUP * 2;
+        const NUM_DRAWS: u64 = TOTAL_ITEMS / 2;
 
         let low_risk_weight = 0.1f64;  // 0.1
         let high_risk_weight = 0.2f64; // 0.2
@@ -1177,9 +1199,9 @@ mod tests {
     }
     #[test]
     fn test_fisher_distribution_is_correct() {
-        const ITEMS_PER_GROUP: u32 = 1000;
-        const TOTAL_ITEMS: u32 = ITEMS_PER_GROUP * 2;
-        const NUM_DRAWS: u32 = TOTAL_ITEMS / 2;
+        const ITEMS_PER_GROUP: u64 = 1000;
+        const TOTAL_ITEMS: u64 = ITEMS_PER_GROUP * 2;
+        const NUM_DRAWS: u64 = TOTAL_ITEMS / 2;
 
         let low_risk_weight = 0.1f64;  // 0.1
         let high_risk_weight = 0.2f64; // 0.2

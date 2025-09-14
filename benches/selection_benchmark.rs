@@ -170,8 +170,8 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(3, MAX_CAPACITY);
             let mut rng = WyRand::from_os_rng();
-            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.random_range(0.001..0.999)); }
-            (dbi, INITIAL_POP as u32, rng)
+            for i in 0..INITIAL_POP { dbi.add(i as u64, rng.random_range(0.001..0.999)); }
+            (dbi, INITIAL_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
             for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove()); }
             for _ in 0..ACQUISITION_COUNT {
@@ -200,8 +200,8 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(5, MAX_CAPACITY);
             let mut rng = WyRand::from_os_rng();
-            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.random_range(0.00001..0.99999)); }
-            (dbi, INITIAL_POP as u32, rng)
+            for i in 0..INITIAL_POP { dbi.add(i as u64, rng.random_range(0.00001..0.99999)); }
+            (dbi, INITIAL_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
             for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove()); }
             for _ in 0..ACQUISITION_COUNT {
@@ -233,9 +233,9 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(3, VERY_LARGE_MAX);
             let mut rng = WyRand::from_os_rng();
             for i in 0..VERY_LARGE_POP {
-                dbi.add(i as u32, rng.random_range(0.001..0.999));
+                dbi.add(i as u64, rng.random_range(0.001..0.999));
             }
-            (dbi, VERY_LARGE_POP as u32, rng)
+            (dbi, VERY_LARGE_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
             for _ in 0..VERY_LARGE_CHURN { black_box(dbi.select_and_remove()); }
             for _ in 0..VERY_LARGE_ACQ {
@@ -273,10 +273,10 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(3, MAX_CAPACITY);
             let mut rng = WyRand::from_os_rng();
-            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.random_range(0.001..0.999)); }
-            (dbi, INITIAL_POP as u32, rng)
+            for i in 0..INITIAL_POP { dbi.add(i as u64, rng.random_range(0.001..0.999)); }
+            (dbi, INITIAL_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
-            black_box(dbi.select_many_and_remove(CHURN_COUNT as u32));
+            black_box(dbi.select_many_and_remove(CHURN_COUNT as u64));
             for _ in 0..ACQUISITION_COUNT {
                 dbi.add(next_id, rng.random_range(0.001..0.999));
                 next_id += 1;
@@ -303,10 +303,10 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(5, MAX_CAPACITY);
             let mut rng = WyRand::from_os_rng();
-            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.random_range(0.00001..0.99999)); }
-            (dbi, INITIAL_POP as u32, rng)
+            for i in 0..INITIAL_POP { dbi.add(i as u64, rng.random_range(0.00001..0.99999)); }
+            (dbi, INITIAL_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
-            black_box(dbi.select_many_and_remove(CHURN_COUNT as u32));
+            black_box(dbi.select_many_and_remove(CHURN_COUNT as u64));
             for _ in 0..ACQUISITION_COUNT {
                 dbi.add(next_id, rng.random_range(0.00001..0.99999));
                 next_id += 1;
@@ -336,11 +336,11 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(3, VERY_LARGE_MAX);
             let mut rng = WyRand::from_os_rng();
             for i in 0..VERY_LARGE_POP {
-                dbi.add(i as u32, rng.random_range(0.001..0.999));
+                dbi.add(i as u64, rng.random_range(0.001..0.999));
             }
-            (dbi, VERY_LARGE_POP as u32, rng)
+            (dbi, VERY_LARGE_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
-            black_box(dbi.select_many_and_remove(VERY_LARGE_CHURN as u32));
+            black_box(dbi.select_many_and_remove(VERY_LARGE_CHURN as u64));
             for _ in 0..VERY_LARGE_ACQ {
                 dbi.add(next_id, rng.random_range(0.001..0.999));
                 next_id += 1;
