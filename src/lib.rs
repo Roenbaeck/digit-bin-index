@@ -274,6 +274,42 @@ impl DigitBinIndex {
         }
     }
 
+    /// Adds multiple items to the index in a highly optimized batch operation.
+    ///
+    /// This method is significantly faster than calling `add` in a loop for large
+    /// collections of items. It works by pre-processing the input, grouping items
+    /// by their shared weight, and then propagating each group through the tree in
+    /// a single pass. This minimizes cache misses and reduces function call overhead.
+    ///
+    /// Weights are rescaled to the index's precision and binned accordingly.
+    /// Items with non-positive weights or weights that become zero after scaling
+    /// will be ignored.
+    ///
+    /// # Arguments
+    ///
+    /// * `items` - A slice of `(id, weight)` tuples to add to the index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    ///
+    /// let mut index = DigitBinIndex::new();
+    /// let items_to_add = vec![(1, 0.1), (2, 0.2), (3, 0.1)];
+    /// index.add_many(&items_to_add);
+    ///
+    /// assert_eq!(index.count(), 3);
+    /// // The total weight should be 0.1 + 0.2 + 0.1 = 0.4
+    /// assert!((index.total_weight() - 0.4).abs() < f64::EPSILON);
+    /// ```
+    pub fn add_many(&mut self, items: &[(u64, f64)]) {
+        match self {
+            DigitBinIndex::Small(index) => index.add_many(items),
+            DigitBinIndex::Medium(index) => index.add_many(items),
+            DigitBinIndex::Large(index) => index.add_many(items),
+        }
+    }
+
     /// Removes an item with the given ID and weight from the index.
     ///
     /// The weight must match the one used during addition (after rescaling).
@@ -616,6 +652,114 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
             Self::add_recurse(&mut children[digit], individual_id, scaled, digits, current_depth + 1, max_depth);
         }
     }
+
+    /// Adds multiple items to the index in a highly optimized batch operation.
+    ///
+    /// This method is significantly faster than calling `add` in a loop for large
+    /// collections of items. It works by first pre-processing the input items,
+    /// grouping them by their shared weight path (e.g., all items with weight 0.123...).
+    /// It then traverses the tree once per group, rather than once per item,
+    /// drastically reducing function call overhead and improving CPU cache performance
+    /// by performing aggregated updates at each node.
+    ///
+    /// # Arguments
+    ///
+    /// * `items` - A slice of `(individual_id, weight)` tuples to add to the index.
+    ///
+    pub fn add_many(&mut self, items: &[(u64, f64)]) {
+        if items.is_empty() {
+            return;
+        }
+
+        // --- Phase 1: Pre-processing ---
+        // Group all IDs by their common weight path (the sequence of digits).
+        // This is the core of the optimization.
+        let mut grouped_ids: std::collections::HashMap<Vec<u8>, Vec<u64>> = std::collections::HashMap::new();
+        
+        // Store the single scaled_weight associated with each path. This avoids
+        // storing the same weight millions of times, as you correctly pointed out.
+        let mut path_weights: std::collections::HashMap<Vec<u8>, u64> = std::collections::HashMap::new();
+
+        for &(id, weight) in items {
+            if let Some((digits, scaled)) = self.weight_to_digits(weight) {
+                // The path is the sequence of digits up to the specified precision.
+                let path = digits[0..self.precision as usize].to_vec();
+                
+                // Use the map's entry API to efficiently handle both new and existing paths.
+                match grouped_ids.entry(path) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        // This path has been seen before, just add the new ID.
+                        entry.get_mut().push(id);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        // First time we've seen this path.
+                        // Clone the key for the second map *before* inserting.
+                        let key = entry.key().clone();
+                        // Insert a new vector with the first ID.
+                        entry.insert(vec![id]);
+                        // Store the shared scaled weight for this new path.
+                        path_weights.insert(key, scaled);
+                    }
+                }
+            }
+        }
+
+        // --- Phase 2: Bulk Insertion ---
+        // Now, iterate through the grouped paths and perform one optimized
+        // recursive insertion for each group.
+        for (path, ids) in grouped_ids {
+            // It's guaranteed that this path exists in path_weights.
+            let scaled_weight = path_weights[&path];
+            Self::add_many_recurse(&mut self.root, &path, &ids, scaled_weight);
+        }
+    }
+
+    /// Recursive helper to insert a batch of items that share the same weight path.
+    fn add_many_recurse(
+        node: &mut Node<B>,
+        path: &[u8],      // The remaining path to traverse
+        ids: &[u64],      // The IDs to insert at the leaf
+        scaled_weight: u64, // The shared scaled weight for this entire group
+    ) {
+        // --- The Core Optimization ---
+        // Instead of adding 1 and `scaled_weight` thousands of times, we do it
+        // just once per node for the entire group. This is a massive reduction
+        // in write operations and dramatically improves cache performance.
+        let group_size = ids.len() as u64;
+        node.content_count += group_size;
+        node.accumulated_value += scaled_weight * group_size;
+
+        // Base Case: We have arrived at the leaf node.
+        if path.is_empty() {
+            // Ensure this node is a Bin. It might be an empty DigitIndex if the
+            // tree was new.
+            if let NodeContent::DigitIndex(_) = &node.content {
+                node.content = NodeContent::Bin(B::default());
+            }
+            
+            // Unload all IDs for this group into the bin.
+            if let NodeContent::Bin(bin) = &mut node.content {
+                for &id in ids {
+                    bin.insert(id);
+                }
+            }
+            return;
+        }
+
+        // Recursive Step: Traverse to the next child.
+        let digit = path[0] as usize;
+        let remaining_path = &path[1..];
+        
+        if let NodeContent::DigitIndex(children) = &mut node.content {
+            // Ensure the child vector is large enough. This allocation only
+            // happens when building the tree structure, not during traversal.
+            if children.len() <= digit {
+                children.resize_with(digit + 1, Node::new_internal);
+            }
+            // Recurse into the appropriate child.
+            Self::bulk_insert_recurse(&mut children[digit], remaining_path, ids, scaled_weight);
+        }
+    }    
 
     pub fn remove(&mut self, individual_id: u64, weight: f64) {
         if let Some((digits, scaled)) = self.weight_to_digits(weight) {
@@ -1078,6 +1222,10 @@ mod python {
 
         fn add(&mut self, id: u64, weight: f64) -> bool {
             self.index.add(id, weight)
+        }
+
+        fn add_many(&mut self, items: Vec<(u64, f64)>) {
+            self.index.add_many(&items)
         }
 
         fn remove(&mut self, id: u64, weight: f64) {
