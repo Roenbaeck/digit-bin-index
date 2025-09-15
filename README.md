@@ -47,13 +47,13 @@ This measures the real-world throughput of both data structures under dynamic co
 
 This benchmark simulates sequential selection by removing 100,000 items one-by-one, then adding 110,000 new items. This is a common pattern in agent-based models or iterative simulations. `DigitBinIndex`'s O(P) complexity gives it a decisive advantage as the population scales.
 
-| Scenario (N items) | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
-| :------------------------- | :--------------------- | :----------------- | :----------------- |
-| **1 Million Items** (p=3)  | **~31.3 ms**           | ~81.4 ms           | **~2.6x faster**   |
-| **1 Million Items** (p=5)  | **~51.8 ms**           | ~79.6 ms           | **~1.5x faster**   |
-| **10 Million Items** (p=3) | **~661.6 ms**          | ~1727.7 ms         | **~2.6x faster**   |
+| Scenario (N items)         | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
+| :------------------------- | :------------------- | :----------------- | :----------------- |
+| **1 Million Items** (p=3)  | **~27.5 ms**         | ~82.2 ms           | **~3.0x faster**   |
+| **1 Million Items** (p=5)  | **~39.7 ms**         | ~77.7 ms           | **~2.0x faster**   |
+| **10 Million Items** (p=3) | **~551.0 ms**        | ~1723.1 ms         | **~3.1x faster**   |
 
-*   **Key Takeaway**: `DigitBinIndex` is **over 2.6 times faster** than the `FenwickTree` for sequential operations on large datasets. Its performance is dependent on precision (`P`) and not the number of items (`N`), allowing it to scale far more effectively.
+*   **Key Takeaway**: `DigitBinIndex` is **over 3.0 times faster** than the `FenwickTree` for sequential operations on large datasets. Its performance is dependent on precision (`P`) and not the number of items (`N`), allowing it to scale far more effectively.
 
 ---
 
@@ -61,13 +61,13 @@ This benchmark simulates sequential selection by removing 100,000 items one-by-o
 
 This benchmark simulates simultaneous selection by removing a large batch of 100,000 unique items at once, followed by the acquisition of 110,000 new items. `DigitBinIndex` uses a highly optimized batch rejection sampling method.
 
-| Scenario (N items) | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
-|:---|:---|:---|:---|
-| **1 Million Items** (p=3)  | **~23.3 ms**           | ~90.0 ms           | **~3.9x faster**   |
-| **1 Million Items** (p=5)  | **~45.0 ms**           | ~90.6 ms           | **~2.0x faster**   |
-| **10 Million Items** (p=3) | **~432.8 ms**          | ~1556.1 ms         | **~3.6x faster**   |
+| Scenario (N items)         | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
+| :------------------------- | :------------------- | :----------------- | :----------------- |
+| **1 Million Items** (p=3)  | **~19.5 ms**         | ~104.2 ms          | **~5.3x faster**   |
+| **1 Million Items** (p=5)  | **~39.9 ms**         | ~106.6 ms          | **~2.7x faster**   |
+| **10 Million Items** (p=3) | **~389.0 ms**        | ~1649.9 ms         | **~4.2x faster**   |
 
-**Key Takeaway**: For batch selections, `DigitBinIndex` is even more efficient, performing **up to 3.9 times faster**. The batched nature of the operation further highlights the architectural advantages of the radix tree approach for this use case.
+**Key Takeaway**: For batch selections, `DigitBinIndex` is even more efficient, performing **up to 5.3 times faster**. The batched nature of the operation further highlights the architectural advantages of the radix tree approach for this use case.
 
 ---
 
