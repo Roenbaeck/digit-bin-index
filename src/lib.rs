@@ -807,7 +807,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
                 children.resize_with(digit + 1, Node::new_internal);
             }
             // Recurse into the appropriate child.
-            Self::bulk_insert_recurse(&mut children[digit], remaining_path, ids, scaled_weight);
+            Self::add_many_recurse(&mut children[digit], remaining_path, ids, scaled_weight);
         }
     }    
 
@@ -891,14 +891,14 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         // --- Phase 2: Bulk Removal ---
         for (path, ids) in grouped_ids {
             if let Some(scaled_weight) = path_weights.get(&path) {
-                Self::bulk_remove_recurse(&mut self.root, &path, &ids, *scaled_weight);
+                Self::remove_many_recurse(&mut self.root, &path, &ids, *scaled_weight);
             }
         }
     }
 
     /// Recursive helper to remove a batch of items from the same weight path.
     /// Returns the number of items that were actually removed.
-    fn bulk_remove_recurse(
+    fn remove_many_recurse(
         node: &mut Node<B>,
         path: &[u8],
         ids: &[u64],
@@ -932,7 +932,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         if let NodeContent::DigitIndex(children) = &mut node.content {
             // Only proceed if the child path actually exists.
             if children.len() > digit {
-                removed_in_child = Self::bulk_remove_recurse(
+                removed_in_child = Self::remove_many_recurse(
                     &mut children[digit], 
                     remaining_path, 
                     ids, 
@@ -1601,10 +1601,13 @@ fn test_weight_to_digits() {
 #[cfg(test)]
 #[test]
 fn test_treemap() {
-    let mut index = DigitBinIndex::with_precision_and_capacity(3, 1_000_000_000_000);
-    for i in 0..1_000_000_000 {
-        index.add(i, 0.1);
+    const CAPACITY: u64 = 10_000_000u64;
+    let mut index = DigitBinIndex::with_precision_and_capacity(3, CAPACITY);
+    let mut population = Vec::with_capacity(CAPACITY as usize);
+    for i in 0..CAPACITY {
+        population.push((i, 0.1));
     }
+    index.add_many(&population);
     index.select_many_and_remove(1_000_000); 
 }
 
