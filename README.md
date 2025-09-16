@@ -113,9 +113,86 @@ Truncating at 3 digits limits the error per item to <0.001. In large populations
 
 ---
 
-## Maximum Item Capacity for `DigitBinIndex`
+## Internal Storage and Capacity
 
-Since the identities used for individuals are u32, the current implementation limits the maxiumum capacity to 2^32 - 1 ≈ 4.29 billion.
+The `DigitBinIndex` is designed to handle a vast range of use cases, from a few thousand items to trillions, by automatically selecting the most appropriate internal storage engine.
+
+### Item Capacity
+
+The index accepts **`u64`** for individual item IDs. However, the internal storage of these IDs depends on the backend chosen.
+
+> [!WARNING]
+> **`u64` ID Truncation:** The `Small (Vec<u32>)` and `Medium (RoaringBitmap)` backends are optimized for `u32` IDs. If you insert an ID that is larger than `u32::MAX` (4,294,967,295) into one of these backends, **it will be silently truncated to a `u32`**.
+>
+> Only the `Large (RoaringTreemap)` backend provides full `u64` ID support. The constructor `with_precision_and_capacity` attempts to guess if you need `u64` support based on the total capacity. If you know you need to store `u64` IDs, it is recommended to manually construct the `Large` variant:
+>
+> ```rust
+> use digit_bin_index::{DigitBinIndex, DigitBinIndexGeneric};
+> use roaring::RoaringTreemap;
+> 
+> // Manually create an index with full u64 support
+> let mut index = DigitBinIndex::Large(DigitBinIndexGeneric::<RoaringTreemap>::with_precision(3));
+> ```
+
+### Automatic Engine Selection
+
+To provide the best balance of performance and memory usage, the library's `DigitBinIndex` is an enum that automatically switches between three different backends (`Small`, `Medium`, and `Large`) when you use the `with_precision_and_capacity()` constructor.
+
+The selection is based on a simple heuristic: the **average number of items expected per bin**, which is calculated as `capacity / 10^precision`.
+
+1.  `Small` (**`Vec<u32>`**):
+    *   **Trigger:** Low average items per bin (<= 1,000).
+    *   **Best for:** Small to medium-sized problems where `select_and_remove` speed is the absolute priority (O(1) `swap_remove`).
+    *   **Warning:** Truncates `u64` IDs. `remove_many` can be O(N) per bin.
+
+2.  `Medium` (**`RoaringBitmap`**):
+    *   **Trigger:** Medium to large average items per bin (> 1,000).
+    *   **Best for:** Large-scale problems (millions to billions of items) where IDs fit within `u32`. Provides excellent memory compression and fast set operations (including `remove_many`).
+    *   **Warning:** Truncates `u64` IDs.
+
+3.  `Large` (**`RoaringTreemap`**):
+    *   **Trigger:** Extremely large average items per bin (> 1,000,000,000). This is used as a heuristic to detect that full `u64` support is required.
+    *   **Best for:** Massive-scale simulations or any dataset that requires the full 64-bit ID space.
+
+### Examples of Engine Selection
+
+Here are some practical examples of how calling `with_precision_and_capacity` translates into a specific internal engine.
+
+#### Example 1: `Small (Vec<u32>)` is Chosen
+
+You are simulating a population of 100,000 individuals with `u32` IDs.
+
+```rust
+// Expecting 100,000 items with 3-digit precision
+let index = DigitBinIndex::with_precision_and_capacity(3, 100_000);
+```
+
+*   **Calculation:** The number of bins is `10^3 = 1,000`. The average items per bin is `100,000 / 1,000 = 100`.
+*   **Result:** Since 100 <= 1,000, the `Small` variant is chosen. This provides the fastest O(1) `select_and_remove` performance. (This would truncate `u64` IDs).
+
+#### Example 2: `Medium (RoaringBitmap)` is Chosen
+
+You need to index 50 million product IDs, all of which fit within `u32`.
+
+```rust
+// Expecting 50 million items with 3-digit precision
+let index = DigitBinIndex::with_precision_and_capacity(3, 50_000_000);
+```
+
+*   **Calculation:** The average items per bin is `50,000,000 / 1,000 = 50,000`.
+*   **Result:** This is > 1,000. The `Medium` variant is selected, using `RoaringBitmap`. This will be highly memory-efficient and very fast for all operations, including `remove_many`. (This would also truncate `u64` IDs).
+
+#### Example 3: `Large (RoaringTreemap)` is Chosen
+
+You are working with a massive dataset where item IDs are 64-bit, and you expect trillions of entries.
+
+```rust
+// Expecting 5 trillion items with 3-digit precision
+let index = DigitBinIndex::with_precision_and_capacity(3, 5_000_000_000_000);
+```
+
+*   **Calculation:** The average items per bin is `5_000_000_000_000 / 1,000 = 5,000,000,000`.
+*   **Result:** This is > 1,000,000,000. The `Large` variant is chosen. The heuristic correctly identifies this as a `u64`-scale problem and selects the only backend, `RoaringTreemap`, that provides full 64-bit ID support.
 
 ---
 
