@@ -368,7 +368,101 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, benchmark_wallenius_simulation, benchmark_fisher_simulation);
+fn insertion_benchmark(c: &mut Criterion) {
+    let mut rng = WyRand::from_os_rng();
+
+    // Shared data generator
+    let mut generate_items = |n: usize| -> Vec<(u64, f64)> {
+        (0..n).map(|i| ((i as u64).wrapping_add(1), rng.random::<f64>())).collect()
+    };
+
+    // 1M items test
+    let items_1m: Vec<_> = generate_items(1_000_000);
+
+    // Test single add (looped)
+    c.bench_function(
+        "Insertion (Single Add Loop)/DigitBinIndex (p=3)/1000000",
+        |b| {
+            b.iter(|| {
+                let mut index = DigitBinIndex::with_precision(3);
+                for &(id, weight) in &items_1m {
+                    index.add(id, weight);
+                }
+                black_box(&index);
+            })
+        },
+    );
+
+    c.bench_function(
+        "Insertion (Single Add Loop)/DigitBinIndex (p=5)/1000000",
+        |b| {
+            b.iter(|| {
+                let mut index = DigitBinIndex::with_precision(5);
+                for &(id, weight) in &items_1m {
+                    index.add(id, weight);
+                }
+                black_box(&index);
+            })
+        },
+    );
+
+    // Test add_many with batch sizes
+    c.bench_function(
+        "Insertion (Add Many At Once)/DigitBinIndex (p=3)/1000000",
+        |b| {
+            b.iter(|| {
+                let mut index = DigitBinIndex::with_precision(3);
+                index.add_many(&items_1m);
+                black_box(&index);
+            })
+        },
+    );
+
+    c.bench_function(
+        "Insertion (Add Many At Once)/DigitBinIndex (p=5)/1000000",
+        |b| {
+            b.iter(|| {
+                let mut index = DigitBinIndex::with_precision(5);
+                index.add_many(&items_1m);
+                black_box(&index);
+            })
+        },
+    );
+
+    // 10M items test (use capacity hint for Roaring)
+    let items_10m: Vec<_> = generate_items(10_000_000);
+    c.bench_function(
+        "Insertion (Single Add Loop)/DigitBinIndex (very large, Roaring)/10000000",
+        |b| {
+            b.iter(|| {
+                let mut index = DigitBinIndex::with_precision_and_capacity(3, 10_000_000);
+                for &(id, weight) in &items_10m {
+                    index.add(id, weight);
+                }
+                black_box(&index);
+            })
+        },
+    );
+
+    c.bench_function(
+        "Insertion (Add Many At Once)/DigitBinIndex (very large, Roaring)/10000000",
+        |b| {
+            b.iter(|| {
+                let mut index = DigitBinIndex::with_precision_and_capacity(3, 10_000_000);
+                index.add_many(&items_10m);
+                black_box(&index);
+            })
+        },
+    );
+
+}
+
+criterion_group!(
+        benches, 
+        benchmark_wallenius_simulation, 
+        benchmark_fisher_simulation,
+        insertion_benchmark
+);
 criterion_main!(benches);
 
 /*
