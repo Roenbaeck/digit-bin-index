@@ -119,39 +119,30 @@ The `DigitBinIndex` is designed to handle a vast range of use cases, from a few 
 
 ### Item Capacity
 
-The index accepts **`u64`** for individual item IDs. However, the internal storage of these IDs depends on the backend chosen.
+The index accepts **`u64`** for individual item IDs. However, the internal storage of these IDs depends on the backend chosen. 
 
-> [!WARNING]
-> **`u64` ID Truncation:** The `Small (Vec<u32>)` and `Medium (RoaringBitmap)` backends are optimized for `u32` IDs. If you insert an ID that is larger than `u32::MAX` (4,294,967,295) into one of these backends, **it will be silently truncated to a `u32`**.
->
-> Only the `Large (RoaringTreemap)` backend provides full `u64` ID support. The constructor `with_precision_and_capacity` attempts to guess if you need `u64` support based on the total capacity. If you know you need to store `u64` IDs, it is recommended to manually construct the `Large` variant:
->
-> ```rust
-> use digit_bin_index::{DigitBinIndex, DigitBinIndexGeneric};
-> use roaring::RoaringTreemap;
-> 
-> // Manually create an index with full u64 support
-> let mut index = DigitBinIndex::Large(DigitBinIndexGeneric::<RoaringTreemap>::with_precision(3));
-> ```
-
-### Automatic Engine Selection
-
-To provide the best balance of performance and memory usage, the library's `DigitBinIndex` is an enum that automatically switches between three different backends (`Small`, `Medium`, and `Large`) when you use the `with_precision_and_capacity()` constructor.
+To provide the best balance of performance and memory usage, the library's `DigitBinIndex` is an enum that automatically switches between three different backends (`Small`, `Medium`, and `Large`) when you use the `with_precision_and_capacity()` constructor or the explicit constructors `small()`, `medium()`, and `large()`.
 
 The selection is based on a simple heuristic: the **average number of items expected per bin**, which is calculated as `capacity / 10^precision`.
 
 1.  `Small` (**`Vec<u32>`**):
-    *   **Trigger:** Low average items per bin (<= 1,000).
+    *   **Constructor:** `small(precision: u8)`.
+    *   **Backend Datatype:** `u32` (max 4 billion).
+    *   **Capacity Trigger:** Low average items per bin (<= 1,000).
     *   **Best for:** Small to medium-sized problems where `select_and_remove` speed is the absolute priority (O(1) `swap_remove`).
-    *   **Warning:** Truncates `u64` IDs. `remove_many` can be O(N) per bin.
+    *   ***Warning:*** Truncates `u64` IDs. `remove_many` can be O(N) per bin.
 
 2.  `Medium` (**`RoaringBitmap`**):
-    *   **Trigger:** Medium to large average items per bin (> 1,000).
+    *   **Constructor:** `medium(precision: u8)`.
+    *   **Backend Datatype:** `u32` (max 4 billion).
+    *   **Capacity Trigger:** Medium to large average items per bin (> 1,000).
     *   **Best for:** Large-scale problems (millions to billions of items) where IDs fit within `u32`. Provides excellent memory compression and fast set operations (including `remove_many`).
-    *   **Warning:** Truncates `u64` IDs.
+    *   ***Warning:*** Truncates `u64` IDs.
 
 3.  `Large` (**`RoaringTreemap`**):
-    *   **Trigger:** Extremely large average items per bin (> 1,000,000,000). This is used as a heuristic to detect that full `u64` support is required.
+    *   **Constructor:** `large(precision: u8)`.
+    *   **Backend Datatype:** `u64` (max 18 quintillion = 18 billion billions).
+    *   **Capacity Trigger:** Extremely large average items per bin (> 1,000,000,000). This is used as a heuristic to detect that full `u64` support is required.
     *   **Best for:** Massive-scale simulations or any dataset that requires the full 64-bit ID space.
 
 ### Examples of Engine Selection

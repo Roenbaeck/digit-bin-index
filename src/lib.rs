@@ -195,6 +195,93 @@ impl DigitBinIndex {
         }
     }
 
+    /// Creates a new DigitBinIndex with Vec<u32> bins and the specified precision.
+    ///
+    /// Optimized for small to medium-sized problems (average <= 1,000 items per bin).
+    /// Provides the fastest O(1) select_and_remove performance but truncates u64 IDs to u32.
+    ///
+    /// # Arguments
+    ///
+    /// * `precision` - The number of decimal places for binning (1 to 9).
+    ///
+    /// # Returns
+    ///
+    /// A new `DigitBinIndex` instance with Vec<u32> bins.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `precision` is 0 or greater than 9.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    ///
+    /// let index = DigitBinIndex::small(3);
+    /// assert_eq!(index.precision(), 3);
+    /// ```
+    pub fn small(precision: u8) -> Self {
+        DigitBinIndex::Small(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
+    }
+
+    /// Creates a new DigitBinIndex with RoaringBitmap bins and the specified precision.
+    ///
+    /// Optimized for large-scale problems (average > 1,000 items per bin) where IDs fit within u32.
+    /// Provides excellent memory compression and fast set operations but truncates u64 IDs to u32.
+    ///
+    /// # Arguments
+    ///
+    /// * `precision` - The number of decimal places for binning (1 to 9).
+    ///
+    /// # Returns
+    ///
+    /// A new `DigitBinIndex` instance with RoaringBitmap bins.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `precision` is 0 or greater than 9.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    ///
+    /// let index = DigitBinIndex::medium(3);
+    /// assert_eq!(index.precision(), 3);
+    /// ```
+    pub fn medium(precision: u8) -> Self {
+        DigitBinIndex::Medium(DigitBinIndexGeneric::<RoaringBitmap>::with_precision(precision))
+    }
+
+    /// Creates a new DigitBinIndex with RoaringTreemap bins and the specified precision.
+    ///
+    /// Optimized for massive-scale problems requiring full u64 ID support (average > 1,000,000,000 items per bin).
+    /// Supports the full 64-bit ID space, ideal for extremely large datasets.
+    ///
+    /// # Arguments
+    ///
+    /// * `precision` - The number of decimal places for binning (1 to 9).
+    ///
+    /// # Returns
+    ///
+    /// A new `DigitBinIndex` instance with RoaringTreemap bins.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `precision` is 0 or greater than 9.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    ///
+    /// let index = DigitBinIndex::large(3);
+    /// assert_eq!(index.precision(), 3);
+    /// ```
+    pub fn large(precision: u8) -> Self {
+        DigitBinIndex::Large(DigitBinIndexGeneric::<RoaringTreemap>::with_precision(precision))
+    }
+
     /// Creates a new `DigitBinIndex` instance with the default precision.
     ///
     /// The default precision is set to 3 decimal places, which provides a good balance
@@ -1302,6 +1389,30 @@ mod python {
             }
         }        
 
+        /// Create a DigitBinIndex with Vec<u32> bins and the specified precision.
+        #[staticmethod]
+        fn small(precision: u8) -> Self {
+            PyDigitBinIndex {
+                index: DigitBinIndex::small(precision),
+            }
+        }
+
+        /// Create a DigitBinIndex with RoaringBitmap bins and the specified precision.
+        #[staticmethod]
+        fn medium(precision: u8) -> Self {
+            PyDigitBinIndex {
+                index: DigitBinIndex::medium(precision),
+            }
+        }
+
+        /// Create a DigitBinIndex with RoaringTreemap bins and the specified precision.
+        #[staticmethod]
+        fn large(precision: u8) -> Self {
+            PyDigitBinIndex {
+                index: DigitBinIndex::large(precision),
+            }
+        }
+
         fn add(&mut self, id: u64, weight: f64) {
             self.index.add(id, weight)
         }
@@ -1340,6 +1451,10 @@ mod python {
 
         fn count(&self) -> u64 {
             self.index.count()
+        }
+
+        fn print_stats(&self) {
+            self.index.print_stats_generic();
         }
     }
 
