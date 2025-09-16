@@ -150,15 +150,15 @@ impl WeightedSelector {
 }
 
 // --- Common benchmark parameters ---
-const INITIAL_POP: usize = 1_000_000;
-const CHURN_COUNT: usize = 100_000;
-const ACQUISITION_COUNT: usize = 110_000;
-const MAX_CAPACITY: usize = INITIAL_POP + ACQUISITION_COUNT;
+const INITIAL_POP: u64 = 1_000_000;
+const CHURN_COUNT: u64 = 100_000;
+const ACQUISITION_COUNT: u64 = 110_000;
+const MAX_CAPACITY: u64 = INITIAL_POP + ACQUISITION_COUNT;
 
-const VERY_LARGE_POP: usize = 10_000_000;
-const VERY_LARGE_CHURN: usize = 1_000_000;
-const VERY_LARGE_ACQ: usize = 1_000_000;
-const VERY_LARGE_MAX: usize = VERY_LARGE_POP + VERY_LARGE_ACQ;
+const VERY_LARGE_POP: u64 = 10_000_000;
+const VERY_LARGE_CHURN: u64 = 1_000_000;
+const VERY_LARGE_ACQ: u64 = 1_000_000;
+const VERY_LARGE_MAX: u64 = VERY_LARGE_POP + VERY_LARGE_ACQ;
 
 // --- Benchmarks (No changes needed here, the logic is identical) ---
 
@@ -170,8 +170,8 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(3, MAX_CAPACITY);
             let mut rng = WyRand::from_os_rng();
-            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.random_range(0.001..0.999)); }
-            (dbi, INITIAL_POP as u32, rng)
+            for i in 0..INITIAL_POP { dbi.add(i as u64, rng.random_range(0.001..0.999)); }
+            (dbi, INITIAL_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
             for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove()); }
             for _ in 0..ACQUISITION_COUNT {
@@ -183,7 +183,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("WeightedSelector (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut selector = WeightedSelector::new(MAX_CAPACITY);
+            let mut selector = WeightedSelector::new(MAX_CAPACITY as usize);
             let mut rng = WyRand::from_os_rng();
             for i in 0..INITIAL_POP { selector.add(i as u32, rng.random_range(0.001..0.999)).unwrap(); }
             (selector, INITIAL_POP as u32, rng)
@@ -200,8 +200,8 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(5, MAX_CAPACITY);
             let mut rng = WyRand::from_os_rng();
-            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.random_range(0.00001..0.99999)); }
-            (dbi, INITIAL_POP as u32, rng)
+            for i in 0..INITIAL_POP { dbi.add(i as u64, rng.random_range(0.00001..0.99999)); }
+            (dbi, INITIAL_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
             for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove()); }
             for _ in 0..ACQUISITION_COUNT {
@@ -213,7 +213,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("WeightedSelector (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut selector = WeightedSelector::new(MAX_CAPACITY);
+            let mut selector = WeightedSelector::new(MAX_CAPACITY as usize);
             let mut rng = WyRand::from_os_rng();
             for i in 0..INITIAL_POP { selector.add(i as u32, rng.random_range(0.00001..0.99999)).unwrap(); }
             (selector, INITIAL_POP as u32, rng)
@@ -233,9 +233,9 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(3, VERY_LARGE_MAX);
             let mut rng = WyRand::from_os_rng();
             for i in 0..VERY_LARGE_POP {
-                dbi.add(i as u32, rng.random_range(0.001..0.999));
+                dbi.add(i as u64, rng.random_range(0.001..0.999));
             }
-            (dbi, VERY_LARGE_POP as u32, rng)
+            (dbi, VERY_LARGE_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
             for _ in 0..VERY_LARGE_CHURN { black_box(dbi.select_and_remove()); }
             for _ in 0..VERY_LARGE_ACQ {
@@ -247,7 +247,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("WeightedSelector (very large, FenwickTree)", VERY_LARGE_POP), |b| {
         b.iter_batched(|| {
-            let mut selector = WeightedSelector::new(VERY_LARGE_MAX);
+            let mut selector = WeightedSelector::new(VERY_LARGE_MAX as usize);
             let mut rng = WyRand::from_os_rng();
             for i in 0..VERY_LARGE_POP {
                 selector.add(i as u32, rng.random_range(0.001..0.999)).unwrap();
@@ -273,10 +273,10 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(3, MAX_CAPACITY);
             let mut rng = WyRand::from_os_rng();
-            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.random_range(0.001..0.999)); }
-            (dbi, INITIAL_POP as u32, rng)
+            for i in 0..INITIAL_POP { dbi.add(i as u64, rng.random_range(0.001..0.999)); }
+            (dbi, INITIAL_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
-            black_box(dbi.select_many_and_remove(CHURN_COUNT as u32));
+            black_box(dbi.select_many_and_remove(CHURN_COUNT as u64));
             for _ in 0..ACQUISITION_COUNT {
                 dbi.add(next_id, rng.random_range(0.001..0.999));
                 next_id += 1;
@@ -286,7 +286,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("WeightedSelector (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut selector = WeightedSelector::new(MAX_CAPACITY);
+            let mut selector = WeightedSelector::new(MAX_CAPACITY as usize);
             let mut rng = WyRand::from_os_rng();
             for i in 0..INITIAL_POP { selector.add(i as u32, rng.random_range(0.001..0.999)).unwrap(); }
             (selector, INITIAL_POP as u32, rng)
@@ -303,10 +303,10 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
         b.iter_batched(|| {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(5, MAX_CAPACITY);
             let mut rng = WyRand::from_os_rng();
-            for i in 0..INITIAL_POP { dbi.add(i as u32, rng.random_range(0.00001..0.99999)); }
-            (dbi, INITIAL_POP as u32, rng)
+            for i in 0..INITIAL_POP { dbi.add(i as u64, rng.random_range(0.00001..0.99999)); }
+            (dbi, INITIAL_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
-            black_box(dbi.select_many_and_remove(CHURN_COUNT as u32));
+            black_box(dbi.select_many_and_remove(CHURN_COUNT as u64));
             for _ in 0..ACQUISITION_COUNT {
                 dbi.add(next_id, rng.random_range(0.00001..0.99999));
                 next_id += 1;
@@ -316,7 +316,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("WeightedSelector (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
-            let mut selector = WeightedSelector::new(MAX_CAPACITY);
+            let mut selector = WeightedSelector::new(MAX_CAPACITY as usize);
             let mut rng = WyRand::from_os_rng();
             for i in 0..INITIAL_POP { selector.add(i as u32, rng.random_range(0.00001..0.99999)).unwrap(); }
             (selector, INITIAL_POP as u32, rng)
@@ -336,11 +336,11 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
             let mut dbi = DigitBinIndex::with_precision_and_capacity(3, VERY_LARGE_MAX);
             let mut rng = WyRand::from_os_rng();
             for i in 0..VERY_LARGE_POP {
-                dbi.add(i as u32, rng.random_range(0.001..0.999));
+                dbi.add(i as u64, rng.random_range(0.001..0.999));
             }
-            (dbi, VERY_LARGE_POP as u32, rng)
+            (dbi, VERY_LARGE_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
-            black_box(dbi.select_many_and_remove(VERY_LARGE_CHURN as u32));
+            black_box(dbi.select_many_and_remove(VERY_LARGE_CHURN as u64));
             for _ in 0..VERY_LARGE_ACQ {
                 dbi.add(next_id, rng.random_range(0.001..0.999));
                 next_id += 1;
@@ -350,7 +350,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("WeightedSelector (very large, FenwickTree)", VERY_LARGE_POP), |b| {
         b.iter_batched(|| {
-            let mut selector = WeightedSelector::new(VERY_LARGE_MAX);
+            let mut selector = WeightedSelector::new(VERY_LARGE_MAX as usize);
             let mut rng = WyRand::from_os_rng();
             for i in 0..VERY_LARGE_POP {
                 selector.add(i as u32, rng.random_range(0.001..0.999)).unwrap();
@@ -368,7 +368,101 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, benchmark_wallenius_simulation, benchmark_fisher_simulation);
+fn insertion_benchmark(c: &mut Criterion) {
+    let mut rng = WyRand::from_os_rng();
+
+    // Shared data generator
+    let mut generate_items = |n: usize| -> Vec<(u64, f64)> {
+        (0..n).map(|i| ((i as u64).wrapping_add(1), rng.random::<f64>())).collect()
+    };
+
+    // 1M items test
+    let items_1m: Vec<_> = generate_items(1_000_000);
+
+    // Test single add (looped)
+    c.bench_function(
+        "Insertion (Single Add Loop)/DigitBinIndex (p=3)/1000000",
+        |b| {
+            b.iter(|| {
+                let mut index = DigitBinIndex::with_precision(3);
+                for &(id, weight) in &items_1m {
+                    index.add(id, weight);
+                }
+                black_box(&index);
+            })
+        },
+    );
+
+    c.bench_function(
+        "Insertion (Single Add Loop)/DigitBinIndex (p=5)/1000000",
+        |b| {
+            b.iter(|| {
+                let mut index = DigitBinIndex::with_precision(5);
+                for &(id, weight) in &items_1m {
+                    index.add(id, weight);
+                }
+                black_box(&index);
+            })
+        },
+    );
+
+    // Test add_many with batch sizes
+    c.bench_function(
+        "Insertion (Add Many At Once)/DigitBinIndex (p=3)/1000000",
+        |b| {
+            b.iter(|| {
+                let mut index = DigitBinIndex::with_precision(3);
+                index.add_many(&items_1m);
+                black_box(&index);
+            })
+        },
+    );
+
+    c.bench_function(
+        "Insertion (Add Many At Once)/DigitBinIndex (p=5)/1000000",
+        |b| {
+            b.iter(|| {
+                let mut index = DigitBinIndex::with_precision(5);
+                index.add_many(&items_1m);
+                black_box(&index);
+            })
+        },
+    );
+
+    // 10M items test (use capacity hint for Roaring)
+    let items_10m: Vec<_> = generate_items(10_000_000);
+    c.bench_function(
+        "Insertion (Single Add Loop)/DigitBinIndex (very large, Roaring)/10000000",
+        |b| {
+            b.iter(|| {
+                let mut index = DigitBinIndex::with_precision_and_capacity(3, 10_000_000);
+                for &(id, weight) in &items_10m {
+                    index.add(id, weight);
+                }
+                black_box(&index);
+            })
+        },
+    );
+
+    c.bench_function(
+        "Insertion (Add Many At Once)/DigitBinIndex (very large, Roaring)/10000000",
+        |b| {
+            b.iter(|| {
+                let mut index = DigitBinIndex::with_precision_and_capacity(3, 10_000_000);
+                index.add_many(&items_10m);
+                black_box(&index);
+            })
+        },
+    );
+
+}
+
+criterion_group!(
+        benches, 
+        benchmark_wallenius_simulation, 
+        benchmark_fisher_simulation,
+        insertion_benchmark
+);
 criterion_main!(benches);
 
 /*

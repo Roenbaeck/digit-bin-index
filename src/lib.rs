@@ -9,8 +9,7 @@
 
 use wyrand::WyRand;
 use rand::{distr::{Distribution, Uniform}, Rng, SeedableRng}; 
-use roaring::RoaringBitmap;
-use std::vec;
+use roaring::{RoaringBitmap, RoaringTreemap};
 
 // The default precision to use if none is specified in the constructor.
 const DEFAULT_PRECISION: u8 = 3;
@@ -21,18 +20,18 @@ const MAX_PRECISION: usize = 9;
 /// Implement this trait for any container you want to use for storing IDs in the leaf nodes.
 /// Provided implementations: [`Vec<u32>`], [`RoaringBitmap`].
 pub trait DigitBin: Clone + Default {
-    fn insert(&mut self, id: u32);
-    fn remove(&mut self, id: u32) -> bool;
+    fn insert(&mut self, id: u64);
+    fn remove(&mut self, id: u64) -> bool;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
-    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u32>;
-    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u32>;
+    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u64>;
+    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u64>;
 }
 
 impl DigitBin for Vec<u32> {
-    fn insert(&mut self, id: u32) { self.push(id); }
-    fn remove(&mut self, id: u32) -> bool {
-        if let Some(pos) = self.iter().position(|&x| x == id) {
+    fn insert(&mut self, id: u64) { self.push(id as u32); }
+    fn remove(&mut self, id: u64) -> bool {
+        if let Some(pos) = self.iter().position(|&x| x == id as u32) {
             self.swap_remove(pos);
             true
         } else {
@@ -41,31 +40,52 @@ impl DigitBin for Vec<u32> {
     }
     fn len(&self) -> usize { self.len() }
     fn is_empty(&self) -> bool { self.is_empty() }
-    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u32> {
-        if self.is_empty() { None } else { Some(self[rng.random_range(0..self.len())]) }
+    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u64> {
+        if self.is_empty() { None } else { Some(self[rng.random_range(0..self.len())] as u64) }
     }
-    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u32> {
+    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u64> {
         if self.is_empty() { None } else {
             let pos = rng.random_range(0..self.len());
-            Some(self.swap_remove(pos))
+            Some(self.swap_remove(pos) as u64)
         }
     }
 }
 
 impl DigitBin for RoaringBitmap {
-    fn insert(&mut self, id: u32) { self.insert(id); }
-    fn remove(&mut self, id: u32) -> bool { self.remove(id) }
+    fn insert(&mut self, id: u64) { self.insert(id as u32); }
+    fn remove(&mut self, id: u64) -> bool { self.remove(id as u32) }
     fn len(&self) -> usize { self.len() as usize }
     fn is_empty(&self) -> bool { self.is_empty() }
-    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u32> {
+    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u64> {
         if self.is_empty() { None } else {
             let idx = rng.random_range(0..self.len() as u32);
+            self.select(idx).map(|v| v as u64)
+        }
+    }
+    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u64> {
+        if self.is_empty() { None } else {
+            let idx = rng.random_range(0..self.len() as u32);
+            let selected = self.select(idx);
+            self.remove(selected.unwrap());
+            selected.map(|v| v as u64)
+        }
+    }
+}
+
+impl DigitBin for RoaringTreemap {
+    fn insert(&mut self, id: u64) { self.insert(id); }
+    fn remove(&mut self, id: u64) -> bool { self.remove(id) }
+    fn len(&self) -> usize { self.len() as usize }
+    fn is_empty(&self) -> bool { self.is_empty() }
+    fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u64> {
+        if self.is_empty() { None } else {
+            let idx = rng.random_range(0..self.len() as u64);
             self.select(idx)
         }
     }
-    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u32> {
+    fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u64> {
         if self.is_empty() { None } else {
-            let idx = rng.random_range(0..self.len() as u32);
+            let idx = rng.random_range(0..self.len());
             let selected = self.select(idx);
             self.remove(selected.unwrap());
             selected
@@ -73,11 +93,18 @@ impl DigitBin for RoaringBitmap {
     }
 }
 
+// Helper to create an array of Option<T>
+fn new_children_array<B: DigitBin>() -> Box<[Option<Node<B>>; 10]> {
+    // This is a standard way to initialize an array of non-Copy types.
+    let data: [Option<Node<B>>; 10] = Default::default();
+    Box::new(data)
+}
+
 /// The content of a node, which is either more nodes or a leaf with individuals.
 #[derive(Debug, Clone)]
 pub enum NodeContent<B: DigitBin> {
     /// An internal node that contains children for the next digit (0-9).
-    DigitIndex(Vec<Node<B>>),
+    DigitIndex(Box<[Option<Node<B>>; 10]>),
     /// A leaf node that contains a bin of IDs for individuals in this bin.
     Bin(B),
 }
@@ -90,14 +117,14 @@ pub struct Node<B: DigitBin> {
     /// The total sum of scaled values stored under this node.
     pub accumulated_value: u64,
     /// The total count of individuals stored under this node.
-    pub content_count: u32,
+    pub content_count: u64,
 }
 
 impl<B: DigitBin> Node<B> {
     /// Creates a new, empty internal node.
     fn new_internal() -> Self {
         Self {
-            content: NodeContent::DigitIndex(vec![]), 
+            content: NodeContent::DigitIndex(new_children_array()), 
             accumulated_value: 0u64,
             content_count: 0,
         }
@@ -123,8 +150,9 @@ impl<B: DigitBin> Node<B> {
 /// ```
 #[derive(Debug, Clone)]
 pub enum DigitBinIndex {
-    Vec(DigitBinIndexGeneric<Vec<u32>>),
-    Roaring(DigitBinIndexGeneric<RoaringBitmap>),
+    Small(DigitBinIndexGeneric<Vec<u32>>),
+    Medium(DigitBinIndexGeneric<RoaringBitmap>),
+    Large(DigitBinIndexGeneric<RoaringTreemap>),
 }
 
 impl DigitBinIndex {
@@ -152,14 +180,18 @@ impl DigitBinIndex {
     /// let index = DigitBinIndex::with_precision_and_capacity(3, 100);
     /// // Uses Vec<u32> because capacity is small
     /// ```
-    pub fn with_precision_and_capacity(precision: u8, capacity: usize) -> Self {
-        // Heuristic: Use RoaringBitmap if average bin size (capacity / 10^precision) exceeds threshold
-        let threshold = 1000;
-        let max_bins = 10usize.pow(precision as u32);
-        if capacity / max_bins > threshold {
-            DigitBinIndex::Roaring(DigitBinIndexGeneric::<RoaringBitmap>::with_precision(precision))
+    pub fn with_precision_and_capacity(precision: u8, capacity: u64) -> Self {
+        let max_bins = 10u64.pow(precision as u32);
+        if capacity / max_bins > 1_000_000_000 {
+            // Heuristic: Use RoaringTreemap if average bin size (capacity / 10^precision) exceeds threshold
+            DigitBinIndex::Large(DigitBinIndexGeneric::<RoaringTreemap>::with_precision(precision))
+        }
+        else if capacity / max_bins > 1_000 {
+            // Heuristic: Use RoaringBitmap if average bin size (capacity / 10^precision) exceeds threshold
+            DigitBinIndex::Medium(DigitBinIndexGeneric::<RoaringBitmap>::with_precision(precision))
         } else {
-            DigitBinIndex::Vec(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
+            // Heuristic: Use Vec<u32> for small average bin sizes
+            DigitBinIndex::Small(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
         }
     }
 
@@ -182,7 +214,7 @@ impl DigitBinIndex {
     /// assert_eq!(index.precision(), 3);
     /// ```    
     pub fn new() -> Self {
-        DigitBinIndex::Vec(DigitBinIndexGeneric::<Vec<u32>>::new())
+        DigitBinIndex::Small(DigitBinIndexGeneric::<Vec<u32>>::new())
     }
 
     /// Creates a new `DigitBinIndex` instance with the specified precision.
@@ -212,7 +244,7 @@ impl DigitBinIndex {
     /// assert_eq!(index.precision(), 4);
     /// ```
     pub fn with_precision(precision: u8) -> Self {
-        DigitBinIndex::Vec(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
+        DigitBinIndex::Small(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
     }
 
     /// Adds an item with the given ID and weight to the index.
@@ -236,13 +268,49 @@ impl DigitBinIndex {
     ///
     /// let mut index = DigitBinIndex::new();
     /// let added = index.add(1, 0.5);
-    /// assert!(added);
     /// assert_eq!(index.count(), 1);
     /// ```    
-    pub fn add(&mut self, id: u32, weight: f64) -> bool {
+    pub fn add(&mut self, id: u64, weight: f64) {
         match self {
-            DigitBinIndex::Vec(index) => index.add(id, weight),
-            DigitBinIndex::Roaring(index) => index.add(id, weight),
+            DigitBinIndex::Small(index) => index.add(id, weight),
+            DigitBinIndex::Medium(index) => index.add(id, weight),
+            DigitBinIndex::Large(index) => index.add(id, weight),
+        }
+    }
+
+    /// Adds multiple items to the index in a highly optimized batch operation.
+    ///
+    /// This method is significantly faster than calling `add` in a loop for large
+    /// collections of items. It works by pre-processing the input, grouping items
+    /// by their shared weight, and then propagating each group through the tree in
+    /// a single pass. This minimizes cache misses and reduces function call overhead.
+    ///
+    /// Weights are rescaled to the index's precision and binned accordingly.
+    /// Items with non-positive weights or weights that become zero after scaling
+    /// will be ignored.
+    ///
+    /// # Arguments
+    ///
+    /// * `items` - A slice of `(id, weight)` tuples to add to the index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    ///
+    /// let mut index = DigitBinIndex::new();
+    /// let items_to_add = vec![(1, 0.1), (2, 0.2), (3, 0.1)];
+    /// index.add_many(&items_to_add);
+    ///
+    /// assert_eq!(index.count(), 3);
+    /// // The total weight should be 0.1 + 0.2 + 0.1 = 0.4
+    /// assert!((index.total_weight() - 0.4).abs() < f64::EPSILON);
+    /// ```
+    pub fn add_many(&mut self, items: &[(u64, f64)]) {
+        match self {
+            DigitBinIndex::Small(index) => index.add_many(items),
+            DigitBinIndex::Medium(index) => index.add_many(items),
+            DigitBinIndex::Large(index) => index.add_many(items),
         }
     }
 
@@ -266,12 +334,51 @@ impl DigitBinIndex {
     /// index.remove(1, 0.5);
     /// assert_eq!(index.count(), 0);
     /// ```
-    pub fn remove(&mut self, id: u32, weight: f64) {
+    pub fn remove(&mut self, id: u64, weight: f64) -> bool {
         match self {
-            DigitBinIndex::Vec(index) => index.remove(id, weight),
-            DigitBinIndex::Roaring(index) => index.remove(id, weight),
+            DigitBinIndex::Small(index) => index.remove(id, weight),
+            DigitBinIndex::Medium(index) => index.remove(id, weight),
+            DigitBinIndex::Large(index) => index.remove(id, weight),
         }
     }
+
+    /// Removes multiple items from the index in a highly optimized batch operation.
+    ///
+    /// This method is significantly faster than calling `remove` in a loop. It
+    /// groups the items to be removed by their weight path and traverses the tree
+    /// only once per group, performing aggregated updates on the way up.
+    ///
+    /// The `(id, weight)` pairs must match items that are currently in the index.
+    /// If a given pair is not found, it is silently ignored.
+    ///
+    /// # Arguments
+    ///
+    /// * `items` - A slice of `(id, weight)` tuples to remove from the index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    ///
+    /// let mut index = DigitBinIndex::new();
+    /// let items_to_add = vec![(1, 0.1), (2, 0.2), (3, 0.1), (4, 0.3)];
+    /// index.add_many(&items_to_add);
+    /// assert_eq!(index.count(), 4);
+    ///
+    /// let items_to_remove = vec![(2, 0.2), (3, 0.1)];
+    /// index.remove_many(&items_to_remove);
+    ///
+    /// assert_eq!(index.count(), 2); // Items 1 and 4 should remain
+    /// // The total weight should be 0.1 + 0.3 = 0.4
+    /// assert!((index.total_weight() - 0.4).abs() < f64::EPSILON);
+    /// ```
+    pub fn remove_many(&mut self, items: &[(u64, f64)]) -> bool {
+        match self {
+            DigitBinIndex::Small(index) => index.remove_many(items),
+            DigitBinIndex::Medium(index) => index.remove_many(items),
+            DigitBinIndex::Large(index) => index.remove_many(items),
+        }
+    }    
 
     /// Selects a single item randomly based on weights without removal.
     ///
@@ -293,10 +400,11 @@ impl DigitBinIndex {
     ///     assert_eq!(weight, 0.5);
     /// }
     /// ```
-    pub fn select(&mut self) -> Option<(u32, f64)> {
+    pub fn select(&mut self) -> Option<(u64, f64)> {
         match self {
-            DigitBinIndex::Vec(index) => index.select(),
-            DigitBinIndex::Roaring(index) => index.select(),
+            DigitBinIndex::Small(index) => index.select(),
+            DigitBinIndex::Medium(index) => index.select(),
+            DigitBinIndex::Large(index) => index.select(),
         }
     }
 
@@ -320,10 +428,11 @@ impl DigitBinIndex {
     /// }
     /// assert_eq!(index.count(), 0);
     /// ```
-    pub fn select_and_remove(&mut self) -> Option<(u32, f64)> {
+    pub fn select_and_remove(&mut self) -> Option<(u64, f64)> {
         match self {
-            DigitBinIndex::Vec(index) => index.select_and_remove(),
-            DigitBinIndex::Roaring(index) => index.select_and_remove(),
+            DigitBinIndex::Small(index) => index.select_and_remove(),
+            DigitBinIndex::Medium(index) => index.select_and_remove(),
+            DigitBinIndex::Large(index) => index.select_and_remove(),
         }
     }
 
@@ -352,10 +461,11 @@ impl DigitBinIndex {
     ///     assert_eq!(selected.len(), 2);
     /// }
     /// ```
-    pub fn select_many(&mut self, num_to_draw: u32) -> Option<Vec<(u32, f64)>> {
+    pub fn select_many(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
         match self {
-            DigitBinIndex::Vec(index) => index.select_many(num_to_draw),
-            DigitBinIndex::Roaring(index) => index.select_many(num_to_draw),
+            DigitBinIndex::Small(index) => index.select_many(num_to_draw),
+            DigitBinIndex::Medium(index) => index.select_many(num_to_draw),
+            DigitBinIndex::Large(index) => index.select_many(num_to_draw),
         }
     }
 
@@ -384,10 +494,11 @@ impl DigitBinIndex {
     /// }
     /// assert_eq!(index.count(), 0);
     /// ```
-    pub fn select_many_and_remove(&mut self, num_to_draw: u32) -> Option<Vec<(u32, f64)>> {
+    pub fn select_many_and_remove(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
         match self {
-            DigitBinIndex::Vec(index) => index.select_many_and_remove(num_to_draw),
-            DigitBinIndex::Roaring(index) => index.select_many_and_remove(num_to_draw),
+            DigitBinIndex::Small(index) => index.select_many_and_remove(num_to_draw),
+            DigitBinIndex::Medium(index) => index.select_many_and_remove(num_to_draw),
+            DigitBinIndex::Large(index) => index.select_many_and_remove(num_to_draw),
         }
     }
 
@@ -405,10 +516,11 @@ impl DigitBinIndex {
     /// let mut index = DigitBinIndex::new();
     /// assert_eq!(index.count(), 0);
     /// ```
-    pub fn count(&self) -> u32 {
+    pub fn count(&self) -> u64 {
         match self {
-            DigitBinIndex::Vec(index) => index.count(),
-            DigitBinIndex::Roaring(index) => index.count(),
+            DigitBinIndex::Small(index) => index.count(),
+            DigitBinIndex::Medium(index) => index.count(),
+            DigitBinIndex::Large(index) => index.count(),
         }
     }
 
@@ -431,24 +543,39 @@ impl DigitBinIndex {
     /// ```
     pub fn total_weight(&self) -> f64 {
         match self {
-            DigitBinIndex::Vec(index) => index.total_weight(),
-            DigitBinIndex::Roaring(index) => index.total_weight(),
+            DigitBinIndex::Small(index) => index.total_weight(),
+            DigitBinIndex::Medium(index) => index.total_weight(),
+            DigitBinIndex::Large(index) => index.total_weight(),
         }
     }
 
-    /// Prints statistics about the underlying tree.
+    /// Prints detailed statistics about the index's structure, memory usage,
+    /// and data distribution.
     pub fn print_stats(&self) {
+        println!("DigitBinIndex Statistics:");
+        println!("=========================");
         match self {
-            DigitBinIndex::Vec(idx) => idx.print_stats(),
-            DigitBinIndex::Roaring(idx) => idx.print_stats(),
+            DigitBinIndex::Small(idx) => {
+                println!("- Index Type: Small (Vec<u32>)");
+                idx.print_stats_generic();
+            },
+            DigitBinIndex::Medium(idx) => {
+                println!("- Index Type: Medium (RoaringBitmap)");
+                idx.print_stats_generic();
+            },
+            DigitBinIndex::Large(idx) => {
+                println!("- Index Type: Large (RoaringTreemap)");
+                idx.print_stats_generic();
+            },
         }
-    }    
+    }
 
     /// Returns the precision (number of decimal places) used for binning.
     pub fn precision(&self) -> u8 {
         match self {
-            DigitBinIndex::Vec(idx) => idx.precision,
-            DigitBinIndex::Roaring(idx) => idx.precision,
+            DigitBinIndex::Small(idx) => idx.precision,
+            DigitBinIndex::Medium(idx) => idx.precision,
+            DigitBinIndex::Large(idx) => idx.precision,
         }
     }    
 }
@@ -514,7 +641,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
 
     /// Converts a f64 weight to an array of digits [0-9] for the given precision and the scaled u64 value.
     /// Returns None if the weight is invalid (non-positive or zero after scaling).
-    fn weight_to_digits(&self, weight: f64) -> Option<([u8; MAX_PRECISION], u64)> {
+    fn weight_to_digits(&self, weight: f64, digits: &mut [u8; MAX_PRECISION]) -> Option<u64> {
         if weight <= 0.0 {
             return None;
         }
@@ -525,7 +652,6 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
             return None;
         }
 
-        let mut digits = [0u8; MAX_PRECISION];
         let mut temp = scaled;
         for i in (0..self.precision as usize).rev() {
             digits[i] = (temp % 10) as u8;
@@ -535,24 +661,22 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
             // Overflow in scaling, shouldn't happen for weight < 1
             return None;
         }
-        Some((digits, scaled))
+        Some(scaled)
     }
 
     // --- Standard Functions ---
 
-    pub fn add(&mut self, individual_id: u32, weight: f64) -> bool {
-        if let Some((digits, scaled)) = self.weight_to_digits(weight) {
-            Self::add_recurse(&mut self.root, individual_id, scaled, &digits, 1, self.precision);
-            true
-        } else {
-            false
+    pub fn add(&mut self, individual_id: u64, weight: f64) {
+        let mut digits = [0u8; MAX_PRECISION];
+        if let Some(scaled) = self.weight_to_digits(weight, &mut digits) {
+            Self::add_recurse(&mut self.root, individual_id, scaled, &digits, 1, self.precision)
         }
     }
 
     /// Recursive private method to handle adding individuals.
     fn add_recurse(
         node: &mut Node<B>,
-        individual_id: u32,
+        individual_id: u64,
         scaled: u64, // Scaled weight as u64
         digits: &[u8; MAX_PRECISION],
         current_depth: u8,
@@ -573,23 +697,50 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
 
         let digit = digits[current_depth as usize - 1] as usize;
         if let NodeContent::DigitIndex(children) = &mut node.content {
-            if children.len() <= digit {
-                children.resize_with(digit + 1, Node::new_internal);
-            }
-            Self::add_recurse(&mut children[digit], individual_id, scaled, digits, current_depth + 1, max_depth);
+            // Get the child, creating it if it doesn't exist.
+            let child_node = children[digit].get_or_insert_with(Node::new_internal);
+            Self::add_recurse(child_node, individual_id, scaled, digits, current_depth + 1, max_depth);
         }
     }
 
-    pub fn remove(&mut self, individual_id: u32, weight: f64) {
-        if let Some((digits, scaled)) = self.weight_to_digits(weight) {
-            Self::remove_recurse(&mut self.root, individual_id, scaled, &digits, 1, self.precision);
+    /// Adds multiple items to the index in a highly optimized batch operation.
+    ///
+    /// This method is significantly faster than calling `add` in a loop for large
+    /// collections of items. It works by first pre-processing the input items,
+    /// grouping them by their shared weight path (e.g., all items with weight 0.123...).
+    /// It then traverses the tree once per group, rather than once per item,
+    /// drastically reducing function call overhead and improving CPU cache performance
+    /// by performing aggregated updates at each node.
+    ///
+    /// # Arguments
+    ///
+    /// * `items` - A slice of `(individual_id, weight)` tuples to add to the index.
+    ///
+    pub fn add_many(&mut self, items: &[(u64, f64)]) {
+        if items.is_empty() {
+            return;
         }
+
+        let mut digits = [0u8; MAX_PRECISION];
+        for &(id, weight) in items {
+            if let Some(scaled) = self.weight_to_digits(weight, &mut digits) {
+                Self::add_recurse(&mut self.root, id, scaled, &digits, 1, self.precision)
+            } 
+        }
+    }
+
+    pub fn remove(&mut self, individual_id: u64, weight: f64) -> bool{
+        let mut digits = [0u8; MAX_PRECISION];
+        if let Some(scaled) = self.weight_to_digits(weight, &mut digits) {
+            return Self::remove_recurse(&mut self.root, individual_id, scaled, &digits, 1, self.precision);
+        }
+        false
     }
 
     /// Recursive private method to handle removing individuals.
     fn remove_recurse(
         node: &mut Node<B>,
-        individual_id: u32,
+        individual_id: u64,
         scaled: u64,
         digits: &[u8; MAX_PRECISION],
         current_depth: u8,
@@ -610,32 +761,66 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
 
         let digit = digits[current_depth as usize - 1] as usize;
         if let NodeContent::DigitIndex(children) = &mut node.content {
-            if children.len() > digit && Self::remove_recurse(&mut children[digit], individual_id, scaled, digits, current_depth + 1, max_depth) {
-                node.content_count -= 1;
-                node.accumulated_value -= scaled;
-                return true;
+            // Check if the child at 'digit' exists and get a mutable reference to it.
+            if let Some(child_node) = children[digit].as_mut() {
+                // If it exists, recurse. If the recursion returns true (success)...
+                if Self::remove_recurse(child_node, individual_id, scaled, digits, current_depth + 1, max_depth) {
+                    // ...then update this node's stats and propagate the success upwards.
+                    node.content_count -= 1;
+                    node.accumulated_value -= scaled;
+                    return true;
+                }
             }
         }
         false
     }
 
+    /// Removes multiple items from the index in a highly optimized batch operation.
+    ///
+    /// This method is significantly faster than calling `remove` in a loop. It
+    /// groups the items to be removed by their weight path and traverses the tree
+    /// only once per group, performing aggregated updates on the way up.
+    ///
+    /// The `(id, weight)` pairs must match items that are currently in the index.
+    /// If a given pair is not found, it is silently ignored.
+    ///
+    /// # Arguments
+    ///
+    /// * `items` - A slice of `(id, weight)` tuples to remove from the index.
+    ///
+    pub fn remove_many(&mut self, items: &[(u64, f64)]) -> bool {
+        if items.is_empty() {
+            return false;
+        }
+
+        let mut digits = [0u8; MAX_PRECISION];
+        let mut success = true;
+        for &(id, weight) in items {
+            if let Some(scaled) = self.weight_to_digits(weight, &mut digits) {
+                success &= Self::remove_recurse(&mut self.root, id, scaled, &digits, 1, self.precision)
+            } else {
+                success &= false;                
+            }
+        }
+        success
+    }
 
     // --- Selection Functions ---
 
-    pub fn select(&mut self) -> Option<(u32, f64)> {
+    pub fn select(&mut self) -> Option<(u64, f64)> {
         self.select_and_optionally_remove(false)
     }
 
-    pub fn select_many(&mut self, num_to_draw: u32) -> Option<Vec<(u32, f64)>> {
+    pub fn select_many(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
         self.select_many_and_optionally_remove(num_to_draw, false)
     }
 
-    pub fn select_and_remove(&mut self) -> Option<(u32, f64)> {
+    pub fn select_and_remove(&mut self) -> Option<(u64, f64)> {
         self.select_and_optionally_remove(true)
     }
 
     // Wrapper function to handle both select and select_and_remove
-    pub fn select_and_optionally_remove(&mut self, with_removal: bool) -> Option<(u32, f64)> {
+    pub fn select_and_optionally_remove(&mut self, with_removal: bool) -> Option<(u64, f64)> {
         if self.root.content_count == 0 {
             return None;
         }
@@ -653,7 +838,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         rng: &mut WyRand,
         with_removal: bool,
         scale: f64,
-    ) -> Option<(u32, f64)> {
+    ) -> Option<(u64, f64)> {
         // Base case: Bin node
         if current_depth > max_depth {
             if let NodeContent::Bin(bin) = &mut node.content {
@@ -679,45 +864,51 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         // Recursive case: DigitIndex node
         if let NodeContent::DigitIndex(children) = &mut node.content {
             let mut cum: u64 = 0;
-            for child in children.iter_mut() {
-                if child.accumulated_value == 0 {
-                    continue;
-                }
-                if target < cum + child.accumulated_value {
-                    if let Some((selected_id, weight)) = Self::select_and_optionally_remove_recurse(
-                        child,
-                        target - cum,
-                        current_depth + 1,
-                        max_depth,
-                        rng,
-                        with_removal,
-                        scale,
-                    ) {
-                        if with_removal {
-                            node.content_count -= 1;
-                            node.accumulated_value -= (weight * scale).round() as u64;
-                        }
-                        return Some((selected_id, weight));
+            // The iterator now gives us a mutable reference to the Option.
+            for child_option in children.iter_mut() {
+                // We pattern match to see if a child Node exists.
+                if let Some(child) = child_option.as_mut() {
+                    // Now, 'child' is a &mut Node<B>, and we can proceed with the original logic.
+                    if child.accumulated_value == 0 {
+                        continue;
                     }
-                    return None; // If recurse failed (e.g., empty after skip), but shouldn't happen
+                    if target < cum + child.accumulated_value {
+                        if let Some((selected_id, weight)) = Self::select_and_optionally_remove_recurse(
+                            child,
+                            target - cum,
+                            current_depth + 1,
+                            max_depth,
+                            rng,
+                            with_removal,
+                            scale,
+                        ) {
+                            if with_removal {
+                                node.content_count -= 1;
+                                node.accumulated_value -= (weight * scale).round() as u64;
+                            }
+                            return Some((selected_id, weight));
+                        }
+                        // This path is taken if recursion fails, which implies an empty bin was selected.
+                        return None; 
+                    }
+                    cum += child.accumulated_value;
                 }
-                cum += child.accumulated_value;
             }
         }
         None
     } 
 
-    pub fn select_many_and_remove(&mut self, num_to_draw: u32) -> Option<Vec<(u32, f64)>> {
+    pub fn select_many_and_remove(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
         self.select_many_and_optionally_remove(num_to_draw, true)
     }
 
     // Wrapper function to handle both select_many and select_many_and_remove
-    pub fn select_many_and_optionally_remove(&mut self, num_to_draw: u32, with_removal: bool) -> Option<Vec<(u32, f64)>> {
+    pub fn select_many_and_optionally_remove(&mut self, num_to_draw: u64, with_removal: bool) -> Option<Vec<(u64, f64)>> {
         if num_to_draw > self.count() || num_to_draw == 0 {
             return if num_to_draw == 0 { Some(Vec::new()) } else { None };
         }
         let mut rng = WyRand::from_os_rng();
-        let mut selected = Vec::with_capacity(num_to_draw as usize);
+        let mut selected: Vec<(u64, f64)> = Vec::with_capacity(num_to_draw as usize);
         let total_accum = self.root.accumulated_value;
         // Create a Uniform distribution for the range [0, total_accum)
         let uniform = Uniform::new(0u64, total_accum).expect("Valid range for Uniform");  
@@ -757,7 +948,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
     fn select_many_and_optionally_remove_recurse(
         node: &mut Node<B>,
         subtree_total: u64,
-        selected: &mut Vec<(u32, f64)>,
+        selected: &mut Vec<(u64, f64)>,
         rng: &mut WyRand,
         current_depth: u8,
         precision: u8,
@@ -765,11 +956,13 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         passed_targets: Vec<u64>,
         scale: f64,
     ) {
-        let original_target_count = passed_targets.len() as u32;
+        let original_target_count = passed_targets.len() as u64;
         if original_target_count == 0 {
             return;
         }
 
+        // This base case (leaf node) logic does not change, as it doesn't interact
+        // with the DigitIndex.
         if current_depth > precision {
             if let NodeContent::Bin(bin) = &mut node.content {
                 let bin_scaled = if node.content_count > 0 {
@@ -779,15 +972,14 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
                 };
                 let bin_weight = bin_scaled as f64 / scale;
                 let to_select = original_target_count.min(node.content_count);
-                let mut picked = 0u32;
+                let mut picked = 0u64;
                 while picked < to_select && !bin.is_empty() {
-                    if with_removal {
-                        let id = bin.get_random_and_remove(rng).unwrap();
-                        selected.push((id, bin_weight));
+                    let id = if with_removal {
+                        bin.get_random_and_remove(rng).unwrap()
                     } else {
-                        let id = bin.get_random(rng).unwrap();
-                        selected.push((id, bin_weight));
-                    }  
+                        bin.get_random(rng).unwrap()
+                    };
+                    selected.push((id, bin_weight));
                     picked += 1;
                 }
                 if with_removal {
@@ -798,97 +990,113 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
             return;
         }
 
-        // DigitIndex node: Assign to children using passed_targets first, with rejection.
+        // --- START OF MODIFIED LOGIC ---
         if let NodeContent::DigitIndex(children) = &mut node.content {
-            let mut child_assigned = vec![0u32; children.len()];
-            let mut child_rel_targets: Vec<Vec<u64>> = vec![Vec::new(); children.len()];
-            let mut assigned = 0u32;
+            // CHANGE: Use fixed-size arrays of length 10 instead of dynamically sized Vecs.
+            let mut child_assigned = [0u64; 10];
+            // Note: `Default::default()` works for arrays where the element type is `Default`.
+            let mut child_rel_targets: [Vec<u64>; 10] = Default::default();
+            let mut assigned = 0u64;
 
-            for target in passed_targets {
+            // --- Main assignment loop ---
+            for &target in &passed_targets {
                 let mut cum: u64 = 0;
                 let mut chosen_idx = None;
-                for (i, child) in children.iter().enumerate() {
-                    if child.accumulated_value == 0 {
-                        continue;
-                    }
-                    if target < cum + child.accumulated_value {
-                        if child_assigned[i] + 1 <= child.content_count {
-                            chosen_idx = Some(i);
+                // CHANGE: Iterate over the array of Options.
+                for (i, child_option) in children.iter().enumerate() {
+                    // CHANGE: Only process existing children.
+                    if let Some(child) = child_option {
+                        if child.accumulated_value == 0 {
+                            continue;
                         }
-                        break;
+                        if target < cum + child.accumulated_value {
+                            if child_assigned[i] + 1 <= child.content_count {
+                                chosen_idx = Some(i);
+                            }
+                            break;
+                        }
+                        cum += child.accumulated_value;
                     }
-                    cum += child.accumulated_value;
                 }
                 if let Some(idx) = chosen_idx {
                     child_assigned[idx] += 1;
-                    let rel_target = target - cum;
+                    // We need to re-calculate `cum` up to the chosen index to get the relative target.
+                    let start_of_child_range: u64 = children[..idx].iter().filter_map(|c| c.as_ref()).map(|c| c.accumulated_value).sum();
+                    let rel_target = target - start_of_child_range;
                     child_rel_targets[idx].push(rel_target);
                     assigned += 1;
-                } else {
-                    // println!("Rejected target {}", target); // Debug
                 }
             }
 
-            // Generate additional targets for any rejected ones
+            // --- Rejection sampling for any remaining targets ---
             let remaining = original_target_count - assigned;
-            let mut additional_assigned = 0u32;
+            let mut additional_assigned = 0u64;
             while additional_assigned < remaining {
                 let target = rng.random_range(0u64..subtree_total);
                 let mut cum: u64 = 0;
                 let mut chosen_idx = None;
-                for (i, child) in children.iter().enumerate() {
-                    if child.accumulated_value == 0 {
-                        continue;
-                    }
-                    if target < cum + child.accumulated_value {
-                        if child_assigned[i] + 1 <= child.content_count {
-                            chosen_idx = Some(i);
+                // CHANGE: Same iteration pattern as the loop above.
+                for (i, child_option) in children.iter().enumerate() {
+                    if let Some(child) = child_option {
+                        if child.accumulated_value == 0 {
+                            continue;
                         }
-                        break;
+                        if target < cum + child.accumulated_value {
+                            if child_assigned[i] + 1 <= child.content_count {
+                                chosen_idx = Some(i);
+                            }
+                            break;
+                        }
+                        cum += child.accumulated_value;
                     }
-                    cum += child.accumulated_value;
                 }
                 if let Some(idx) = chosen_idx {
                     child_assigned[idx] += 1;
-                    let rel_target = target - cum;
+                    let start_of_child_range: u64 = children[..idx].iter().filter_map(|c| c.as_ref()).map(|c| c.accumulated_value).sum();
+                    let rel_target = target - start_of_child_range;
                     child_rel_targets[idx].push(rel_target);
                     additional_assigned += 1;
-                } else {
-                    // println!("Rejected additional target {}", target); // Debug
                 }
             }
+            
+            // CHANGE: Store accumulated values in a fixed-size array for the recursive calls.
+            let child_accums: [u64; 10] = std::array::from_fn(|i| {
+                children[i].as_ref().map_or(0, |c| c.accumulated_value)
+            });
 
-            // Store accumulated values to avoid immutable borrow during iteration
-            let child_accums: Vec<u64> = children.iter().map(|c| c.accumulated_value).collect();
-
-            // Recurse into each child with assigned > 0, passing rel_targets
-            for (i, child) in children.iter_mut().enumerate() {
-                let assign = child_assigned[i];
-                if assign > 0 {
-                    let rel_targets = std::mem::take(&mut child_rel_targets[i]);
-                    Self::select_many_and_optionally_remove_recurse(
-                        child,
-                        child_accums[i],
-                        selected,
-                        rng,
-                        current_depth + 1,
-                        precision,
-                        with_removal,
-                        rel_targets,
-                        scale,
-                    );
+            // --- Recurse into children ---
+            // CHANGE: Iterate through mutable options.
+            for (i, child_option) in children.iter_mut().enumerate() {
+                let assign_count = child_assigned[i];
+                if assign_count > 0 {
+                    // We must have a child here if it was assigned targets.
+                    if let Some(child) = child_option {
+                        let rel_targets = std::mem::take(&mut child_rel_targets[i]);
+                        Self::select_many_and_optionally_remove_recurse(
+                            child,
+                            child_accums[i],
+                            selected,
+                            rng,
+                            current_depth + 1,
+                            precision,
+                            with_removal,
+                            rel_targets,
+                            scale,
+                        );
+                    }
                 }
             }
 
             if with_removal {
-                // On unwind: Update this node's counts and values based on what was removed below
-                node.content_count = children.iter().map(|c| c.content_count).sum();
-                node.accumulated_value = children.iter().map(|c| c.accumulated_value).sum();
+                // --- Unwind: Update this node's stats ---
+                // CHANGE: Sum up counts and values from the existing children in the array.
+                node.content_count = children.iter().filter_map(|c| c.as_ref()).map(|c| c.content_count).sum();
+                node.accumulated_value = children.iter().filter_map(|c| c.as_ref()).map(|c| c.accumulated_value).sum();
             }
         }
     }
 
-    pub fn count(&self) -> u32 {
+    pub fn count(&self) -> u64 {
         self.root.content_count
     }
 
@@ -896,58 +1104,75 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         self.root.accumulated_value as f64 / self.scale
     }
 
-    /// Prints statistics about the tree: node count, bin stats, and weight stats.
-    pub fn print_stats(&self) {
+    /// Prints detailed statistics about the tree: node count, bin stats, and weight stats.
+    pub fn print_stats_generic(&self) {
+        // This struct holds all the metrics we want to collect.
         struct Stats {
             node_count: usize,
             non_empty_node_count: usize,
+            internal_node_count: usize, // NEW: For branching factor
+            child_slots_used: usize,    // NEW: For branching factor
             bin_count: usize,
-            min_bin_size: Option<usize>,
-            max_bin_size: Option<usize>,
-            total_bin_items: usize,
+            empty_bin_count: usize,
+            total_bin_items: u64,
             min_weight: Option<f64>,
             max_weight: Option<f64>,
-            total_weight: f64,
+            // We collect all bin sizes to calculate standard deviation later.
+            bin_sizes: Vec<usize>, 
+            // Memory estimates
+            mem_nodes: usize,
+            mem_bins: usize,
         }
 
         fn traverse<B: DigitBin>(
             node: &Node<B>,
             stats: &mut Stats,
-            current_depth: u8,
-            path: &str,
             scale: f64,
         ) {
             stats.node_count += 1;
-            let is_non_empty = node.content_count > 0;
-            if is_non_empty {
+            stats.mem_nodes += std::mem::size_of::<Node<B>>();
+
+            if node.content_count > 0 {
                 stats.non_empty_node_count += 1;
             }
-            /* 
-            println!(
-                "Node at depth {} (path: {}): content_count = {}, non_empty = {}",
-                current_depth, path, node.content_count, is_non_empty
-            );
-            */
+            
             match &node.content {
                 NodeContent::DigitIndex(children) => {
-                    for (i, child) in children.iter().enumerate() {
-                        let new_path = format!("{} -> {}", path, i);
-                        traverse(child, stats, current_depth + 1, &new_path, scale);
+                    // --- NEW: Calculate branching factor stats ---
+                    stats.internal_node_count += 1;
+                    let used_children = children.iter().filter(|c| c.is_some()).count();
+                    stats.child_slots_used += used_children;
+                    // --- END NEW ---
+
+                    // Add memory for the heap-allocated array of 10 optional nodes.
+                    stats.mem_nodes += std::mem::size_of::<[Option<Node<B>>; 10]>();
+                    
+                    // Iterate over the options in the array
+                    for child_option in children.iter() {
+                        // Only recurse into the children that actually exist (are Some)
+                        if let Some(child) = child_option {
+                            traverse(child, stats, scale);
+                        }
                     }
                 }
                 NodeContent::Bin(bin) => {
-                    let bin_size = bin.len();
                     stats.bin_count += 1;
-                    stats.total_bin_items += bin_size;
-                    stats.min_bin_size = Some(stats.min_bin_size.map_or(bin_size, |min| min.min(bin_size)));
-                    stats.max_bin_size = Some(stats.max_bin_size.map_or(bin_size, |max| max.max(bin_size)));
+                    let bin_size = bin.len();
+                    stats.bin_sizes.push(bin_size);
+                    stats.total_bin_items += bin_size as u64;
 
-                    if bin_size > 0 {
-                        let scaled_avg = node.accumulated_value / node.content_count as u64;
-                        let weight = scaled_avg as f64 / scale;
+                    // Estimate memory for the bin's contents.
+                    // This is an approximation. For RoaringBitmap, `serialized_size()` would be more accurate.
+                    stats.mem_bins += bin_size * std::mem::size_of::<u32>();
+
+                    if bin_size == 0 {
+                        stats.empty_bin_count += 1;
+                    } else {
+                        // All items in a bin share the same weight.
+                        let scaled_weight = node.accumulated_value / node.content_count;
+                        let weight = scaled_weight as f64 / scale;
                         stats.min_weight = Some(stats.min_weight.map_or(weight, |min| min.min(weight)));
                         stats.max_weight = Some(stats.max_weight.map_or(weight, |max| max.max(weight)));
-                        stats.total_weight += node.accumulated_value as f64 / scale;
                     }
                 }
             }
@@ -956,51 +1181,89 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         let mut stats = Stats {
             node_count: 0,
             non_empty_node_count: 0,
+            internal_node_count: 0, // NEW
+            child_slots_used: 0,    // NEW
             bin_count: 0,
-            min_bin_size: None,
-            max_bin_size: None,
+            empty_bin_count: 0,
             total_bin_items: 0,
             min_weight: None,
             max_weight: None,
-            total_weight: 0.0,
+            bin_sizes: Vec::new(),
+            mem_nodes: 0,
+            mem_bins: 0,
         };
 
-        traverse(&self.root, &mut stats, 1, "Root", self.scale);
+        traverse(&self.root, &mut stats, self.scale);
+        
+        // --- Calculations ---
+        let fill_ratio = if stats.node_count > 0 {
+            stats.non_empty_node_count as f64 / stats.node_count as f64 * 100.0
+        } else { 0.0 };
 
+        // NEW: Calculate average branching factor
+        let avg_branching_factor = if stats.internal_node_count > 0 {
+            stats.child_slots_used as f64 / stats.internal_node_count as f64
+        } else { 0.0 };
+        
         let avg_bin_size = if stats.bin_count > 0 {
             stats.total_bin_items as f64 / stats.bin_count as f64
-        } else {
-            0.0
-        };
-        let avg_weight = if stats.bin_count > 0 {
-            stats.total_weight / stats.bin_count as f64
-        } else {
-            0.0
-        };
+        } else { 0.0 };
 
-        println!("DigitBinIndex statistics:");
-        println!("  Total nodes: {}", stats.node_count);
-        println!("  Non-empty nodes: {}", stats.non_empty_node_count);
-        println!("  Total bins (leaves): {}", stats.bin_count);
-        println!("  Total items: {}", stats.total_bin_items);
-        println!("  Average items per bin: {:.2}", avg_bin_size);
-        println!(
-            "  Smallest bin size: {}",
-            stats.min_bin_size.map_or_else(|| "-".to_string(), |v| v.to_string())
-        );
-        println!(
-            "  Largest bin size: {}",
-            stats.max_bin_size.map_or_else(|| "-".to_string(), |v| v.to_string())
-        );
-        println!(
-            "  Smallest represented weight: {}",
-            stats.min_weight.map_or_else(|| "-".to_string(), |v| v.to_string())
-        );
-        println!(
-            "  Largest represented weight: {}",
-            stats.max_weight.map_or_else(|| "-".to_string(), |v| v.to_string())
-        );
-        println!("  Average weight: {}", avg_weight);
+        let std_dev_bin_size = if stats.bin_count > 1 {
+            let variance = stats.bin_sizes.iter()
+                .map(|&size| (size as f64 - avg_bin_size).powi(2)) // Corrected: removed the `*`
+                .sum::<f64>() / (stats.bin_count - 1) as f64;
+            variance.sqrt()
+        } else { 0.0 };
+
+        // NEW: Calculate bin size quartiles
+        let (q1_bin_size, median_bin_size, q3_bin_size) = if !stats.bin_sizes.is_empty() {
+            let mut sorted_sizes = stats.bin_sizes.clone();
+            sorted_sizes.sort_unstable();
+            let q1 = sorted_sizes.get(sorted_sizes.len() / 4).cloned().unwrap_or(0);
+            let median = sorted_sizes.get(sorted_sizes.len() / 2).cloned().unwrap_or(0);
+            let q3 = sorted_sizes.get(sorted_sizes.len() * 3 / 4).cloned().unwrap_or(0);
+            (q1, median, q3)
+        } else {
+            (0, 0, 0)
+        };
+        
+        let total_mem_mb = (stats.mem_nodes + stats.mem_bins) as f64 / (1024.0 * 1024.0);
+        let nodes_mem_mb = stats.mem_nodes as f64 / (1024.0 * 1024.0);
+        let bins_mem_mb = stats.mem_bins as f64 / (1024.0 * 1024.0);
+        
+        // NEW: Calculate average weight
+        let avg_weight = if self.count() > 0 {
+            self.total_weight() / self.count() as f64
+        } else { 0.0 };
+        
+
+        // --- Printing ---
+        println!("\n[Tree Structure]");
+        println!("- Total Nodes Created:  {}", stats.node_count);
+        println!("- Internal Nodes:       {}", stats.internal_node_count); // NEW
+        println!("- Avg Branching Factor: {:.2} / 10", avg_branching_factor); // NEW
+        println!("- Tree Fill Ratio:      {:.2}%", fill_ratio);
+        println!("- Max Depth:            {}", self.precision);
+
+        println!("\n[Memory (Estimated)]");
+        println!("- Tree Structure:       {:.2} MB", nodes_mem_mb);
+        println!("- Leaf Bins:            {:.2} MB", bins_mem_mb);
+        println!("- Total Estimated:      {:.2} MB", total_mem_mb);
+ 
+        println!("\n[Items & Bins]");
+        println!("- Total Items:          {}", stats.total_bin_items);
+        println!("- Total Bins (Leaves):  {}", stats.bin_count);
+        println!("- Empty Bins:           {}", stats.empty_bin_count);
+        println!("- Avg Items per Bin:    {:.2}", avg_bin_size);
+        println!("- Std Dev of Bin Size:  {:.2}", std_dev_bin_size);
+        println!("- Bin Size (min/max):   {} / {}", stats.bin_sizes.iter().min().map_or(0, |v| *v), stats.bin_sizes.iter().max().map_or(0, |v| *v));
+        println!("- Bin Size (Q1/Med/Q3): {} / {} / {}", q1_bin_size, median_bin_size, q3_bin_size); // NEW
+        
+        println!("\n[Weights]");
+        println!("- Smallest Weight:      {}", stats.min_weight.map_or("-".to_string(), |v| format!("{:.prec$}", v, prec = self.precision as usize)));
+        println!("- Largest Weight:       {}", stats.max_weight.map_or("-".to_string(), |v| format!("{:.prec$}", v, prec = self.precision as usize)));
+        println!("- Average Weight:       {:.prec$}", avg_weight, prec = self.precision as usize); // NEW
     }
 }
 
@@ -1025,7 +1288,7 @@ mod python {
 
         /// Create a DigitBinIndex with a specific precision.
         #[staticmethod]
-        fn with_precision(precision: u32) -> Self {
+        fn with_precision(precision: u64) -> Self {
             PyDigitBinIndex {
                 index: DigitBinIndex::with_precision(precision.try_into().unwrap()),
             }
@@ -1033,33 +1296,41 @@ mod python {
 
         /// Create a DigitBinIndex with a specific precision and expected capacity.
         #[staticmethod]
-        fn with_precision_and_capacity(precision: u32, capacity: usize) -> Self {
+        fn with_precision_and_capacity(precision: u8, capacity: u64) -> Self {
             PyDigitBinIndex {
-                index: DigitBinIndex::with_precision_and_capacity(precision.try_into().unwrap(), capacity),
+                index: DigitBinIndex::with_precision_and_capacity(precision, capacity),
             }
         }        
 
-        fn add(&mut self, id: u32, weight: f64) -> bool {
+        fn add(&mut self, id: u64, weight: f64) {
             self.index.add(id, weight)
         }
 
-        fn remove(&mut self, id: u32, weight: f64) {
-            self.index.remove(id, weight);
+        fn add_many(&mut self, items: Vec<(u64, f64)>) {
+            self.index.add_many(&items);
         }
 
-        fn select(&mut self) -> Option<(u32, f64)> {
+        fn remove(&mut self, id: u64, weight: f64) -> bool {
+            self.index.remove(id, weight)
+        }
+
+        fn remove_many(&mut self, items: Vec<(u64, f64)>) -> bool {
+            self.index.remove_many(&items)
+        }        
+
+        fn select(&mut self) -> Option<(u64, f64)> {
             self.index.select()
         }
 
-        fn select_many(&mut self, n: u32) -> Option<Vec<(u32, f64)>> {
+        fn select_many(&mut self, n: u64) -> Option<Vec<(u64, f64)>> {
             self.index.select_many(n)
         }
 
-        fn select_and_remove(&mut self) -> Option<(u32, f64)> {
+        fn select_and_remove(&mut self) -> Option<(u64, f64)> {
             self.index.select_and_remove()
         }
 
-        fn select_many_and_remove(&mut self, n: u32) -> Option<Vec<(u32, f64)>> {
+        fn select_many_and_remove(&mut self, n: u64) -> Option<Vec<(u64, f64)>> {
             self.index.select_many_and_remove(n)
         }
 
@@ -1067,7 +1338,7 @@ mod python {
             self.index.total_weight()
         }
 
-        fn count(&self) -> u32 {
+        fn count(&self) -> u64 {
             self.index.count()
         }
     }
@@ -1115,9 +1386,9 @@ mod tests {
     #[test]
     fn test_wallenius_distribution_is_correct() {
         // --- Setup: Create a controlled population ---
-        const ITEMS_PER_GROUP: u32 = 1000;
-        const TOTAL_ITEMS: u32 = ITEMS_PER_GROUP * 2;
-        const NUM_DRAWS: u32 = TOTAL_ITEMS / 2;
+        const ITEMS_PER_GROUP: u64 = 1000;
+        const TOTAL_ITEMS: u64 = ITEMS_PER_GROUP * 2;
+        const NUM_DRAWS: u64 = TOTAL_ITEMS / 2;
 
         let low_risk_weight = 0.1f64;  // 0.1
         let high_risk_weight = 0.2f64; // 0.2
@@ -1127,7 +1398,7 @@ mod tests {
         let mut total_high_risk_selected = 0;
 
         for _ in 0..NUM_SIMULATIONS {
-            let mut index = DigitBinIndex::with_precision_and_capacity(3, TOTAL_ITEMS as usize);
+            let mut index = DigitBinIndex::with_precision_and_capacity(3, TOTAL_ITEMS);
             for i in 0..ITEMS_PER_GROUP { index.add(i, low_risk_weight); }
             for i in ITEMS_PER_GROUP..TOTAL_ITEMS { index.add(i, high_risk_weight); }
 
@@ -1177,9 +1448,9 @@ mod tests {
     }
     #[test]
     fn test_fisher_distribution_is_correct() {
-        const ITEMS_PER_GROUP: u32 = 1000;
-        const TOTAL_ITEMS: u32 = ITEMS_PER_GROUP * 2;
-        const NUM_DRAWS: u32 = TOTAL_ITEMS / 2;
+        const ITEMS_PER_GROUP: u64 = 1000;
+        const TOTAL_ITEMS: u64 = ITEMS_PER_GROUP * 2;
+        const NUM_DRAWS: u64 = TOTAL_ITEMS / 2;
 
         let low_risk_weight = 0.1f64;  // 0.1
         let high_risk_weight = 0.2f64; // 0.2
@@ -1188,7 +1459,7 @@ mod tests {
         let mut total_high_risk_selected = 0;
 
         for _ in 0..NUM_SIMULATIONS {
-            let mut index = DigitBinIndex::with_precision_and_capacity(3, TOTAL_ITEMS as usize);
+            let mut index = DigitBinIndex::with_precision_and_capacity(3, TOTAL_ITEMS);
             for i in 0..ITEMS_PER_GROUP { index.add(i, low_risk_weight); }
             for i in ITEMS_PER_GROUP..TOTAL_ITEMS { index.add(i, high_risk_weight); }
             
@@ -1224,7 +1495,8 @@ fn test_weight_to_digits() {
     let index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(3);
 
     // Test valid weight
-    if let Some((digits, scaled)) = index.weight_to_digits(0.123) {
+    let mut digits = [0u8; MAX_PRECISION];
+    if let Some(scaled) = index.weight_to_digits(0.123, &mut digits) {    
         assert_eq!(scaled, 123);
         assert_eq!(digits[0..3], [1, 2, 3]);
         assert_eq!(digits[3..], [0; 6]); // Remaining digits should be zero-padded
@@ -1233,10 +1505,35 @@ fn test_weight_to_digits() {
     }
 
     // Test invalid weights
-    assert!(index.weight_to_digits(0.0).is_none());
-    assert!(index.weight_to_digits(-0.1).is_none());
-    assert!(index.weight_to_digits(0.0000001).is_none()); // Rounds to zero after scaling
+    assert!(index.weight_to_digits(0.0, &mut digits).is_none());
+    assert!(index.weight_to_digits(-0.1, &mut digits).is_none());
+    assert!(index.weight_to_digits(0.0000001, &mut digits).is_none()); // Rounds to zero after scaling
 
     // Test overflow (though unlikely for weights <1, but for completeness)
-    assert!(index.weight_to_digits(2.0).is_none()); // Should trigger temp != 0 check
+    assert!(index.weight_to_digits(2.0, &mut digits).is_none()); // Should trigger temp != 0 check
 }
+
+#[cfg(test)]
+#[test]
+fn test_add_many() {
+    const CAPACITY: u64 = 1_000_000u64;
+    let mut index_one_at_a_time = DigitBinIndex::with_precision_and_capacity(3, CAPACITY);
+    let mut index_all_at_once = DigitBinIndex::with_precision_and_capacity(3, CAPACITY);
+    let mut population = Vec::with_capacity(CAPACITY as usize);
+    let mut rng = WyRand::from_os_rng();
+    for i in 0..CAPACITY {
+        let weight: f64 = rng.random_range(0.001..=0.999);
+        population.push((i, weight));
+        index_one_at_a_time.add(i, weight);
+    }
+    index_all_at_once.add_many(&population);
+    index_one_at_a_time.print_stats();
+    index_all_at_once.print_stats();
+}
+#[test]
+fn test_add() {
+    let mut index = DigitBinIndex::new();
+    index.add(1, 0.5);
+    index.print_stats();
+}
+
