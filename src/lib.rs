@@ -1302,20 +1302,20 @@ mod python {
             }
         }        
 
-        fn add(&mut self, id: u64, weight: f64) -> bool {
+        fn add(&mut self, id: u64, weight: f64) {
             self.index.add(id, weight)
         }
 
         fn add_many(&mut self, items: Vec<(u64, f64)>) {
-            self.index.add_many(&items)
+            self.index.add_many(&items);
         }
 
-        fn remove(&mut self, id: u64, weight: f64) {
-            self.index.remove(id, weight);
+        fn remove(&mut self, id: u64, weight: f64) -> bool {
+            self.index.remove(id, weight)
         }
 
-        fn remove_many(&mut self, items: Vec<(u64, f64)>) {
-            self.index.remove_many(&items);
+        fn remove_many(&mut self, items: Vec<(u64, f64)>) -> bool {
+            self.index.remove_many(&items)
         }        
 
         fn select(&mut self) -> Option<(u64, f64)> {
