@@ -1454,7 +1454,7 @@ mod python {
         }
 
         fn print_stats(&self) {
-            self.index.print_stats_generic();
+            self.index.print_stats();
         }
     }
 
