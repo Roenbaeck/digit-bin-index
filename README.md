@@ -257,7 +257,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-digit-bin-index = "0.3.0" # Replace with the latest version from crates.io
+digit-bin-index = "0.4.0" # Replace with the latest version from crates.io
 ```
 
 Example usage:
