@@ -71,6 +71,12 @@ for i in range({num_items_to_test}):
     select_many_stmt = "index.select_many_and_remove(100)"
     select_many_time = timeit.timeit(stmt=select_many_stmt, setup=setup_code_select, number=number_of_runs_many)
     print(f"{number_of_runs_many:,} multi-selections of 100: {select_many_time:.6f} seconds")
+
+    number_of_runs_many = 10
+    select_many_stmt = "index.select_many_and_remove(10_000)"
+    select_many_time = timeit.timeit(stmt=select_many_stmt, setup=setup_code_select, number=number_of_runs_many)
+    print(f"{number_of_runs_many:,} multi-selections of 10,000: {select_many_time:.6f} seconds")
+
     print("-" * (35 + len(f"{num_items_to_test:,}")))
     
     # Return memory used to help decide if we should continue

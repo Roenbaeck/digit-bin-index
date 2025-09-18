@@ -729,12 +729,11 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
     /// Converts a f64 weight to an array of digits [0-9] for the given precision and the scaled u64 value.
     /// Returns None if the weight is invalid (non-positive or zero after scaling).
     fn weight_to_digits(&self, weight: f64, digits: &mut [u8; MAX_PRECISION]) -> Option<u64> {
-        if weight <= 0.0 {
+        if weight <= 0.0 || weight >= 1.0 {
             return None;
         }
 
-        let scaled_f = weight * self.scale;
-        let scaled = scaled_f.round() as u64;
+        let scaled = (weight * self.scale) as u64;
         if scaled == 0 {
             return None;
         }
@@ -743,10 +742,6 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         for i in (0..self.precision as usize).rev() {
             digits[i] = (temp % 10) as u8;
             temp /= 10;
-        }
-        if temp != 0 {
-            // Overflow in scaling, shouldn't happen for weight < 1
-            return None;
         }
         Some(scaled)
     }
