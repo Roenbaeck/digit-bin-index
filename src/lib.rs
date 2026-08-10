@@ -243,7 +243,7 @@ impl<B: DigitBin> DigitIndex<B> {
         self.children[digit].as_mut()
     }
 
-    fn iter(&self) -> impl Iterator<Item = &Option<Node<B>>> {
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &Option<Node<B>>> {
         self.children.iter()
     }
 
