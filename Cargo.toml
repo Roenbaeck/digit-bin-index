@@ -18,7 +18,7 @@ roaring = "0.11"
 
 [dependencies.pyo3]
 version = "0.26.0"
-features = ["extension-module", "abi3-py38", "macros"] # Added abi3-py38 for broader Python compatibility
+features = ["abi3-py38", "macros"]
 optional = true
 
 [features]
@@ -39,4 +39,3 @@ codegen-units = 1  # Better optimizations, slower compiles
 [[bench]]
 name = "selection_benchmark"
 harness = false
-

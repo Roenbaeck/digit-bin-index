@@ -40,7 +40,7 @@ and [Wallenius' distribution](https://docs.scipy.org/doc/scipy/reference/generat
   iteration/draining rather than repeated rank selection. Deterministic tests
   cover no-removal uniqueness and aggregate preservation.
 
-- [ ] **Stop silently truncating public `u64` IDs in the default, Small, and
+- [x] **Stop silently truncating public `u64` IDs in the default, Small, and
   Medium backends.** Both [`Vec<u32>`](src/lib.rs#L31) and
   [`RoaringBitmap`](src/lib.rs#L54) cast IDs with `as u32`; the default
   constructors choose one of these backends even though `add` accepts `u64`.
@@ -49,7 +49,7 @@ and [Wallenius' distribution](https://docs.scipy.org/doc/scipy/reference/generat
   specific, or use `u64` storage by default. Add boundary tests for `u32::MAX`
   and `u32::MAX + 1` for every constructor.
 
-- [ ] **Define and enforce duplicate-ID semantics before updating aggregates.**
+- [x] **Define and enforce duplicate-ID semantics before updating aggregates.**
   [`add_recurse`](src/lib.rs#L767) increments `content_count` and
   `accumulated_value` unconditionally. `RoaringBitmap` and `RoaringTreemap` are
   sets, so adding the same ID to the same bin twice stores one entry but counts
@@ -61,7 +61,7 @@ and [Wallenius' distribution](https://docs.scipy.org/doc/scipy/reference/generat
 
 ## P1 - Reliability and API behavior
 
-- [ ] **Define a validated weight contract and make quantization stable.**
+- [x] **Define a validated weight contract and make quantization stable.**
   [`weight_to_digits`](src/lib.rs#L731) silently rejects `weight >= 1.0`, while
   `add` documents only non-positive values as invalid and incorrectly claims to
   return a success boolean. Binary floating-point also moves ordinary decimal
@@ -79,7 +79,7 @@ and [Wallenius' distribution](https://docs.scipy.org/doc/scipy/reference/generat
   is governed by the centered total-count variance rather than saturated weight
   mass.
 
-- [ ] **Use checked aggregate arithmetic and document capacity limits.**
+- [x] **Use checked aggregate arithmetic and document capacity limits.**
   [`content_count += 1` and `accumulated_value += scaled`](src/lib.rs#L767) can
   panic in debug builds or wrap in release builds, after which random ranges and
   subtraction are unsafe. This is reachable at roughly 18.4 billion maximum
@@ -89,14 +89,14 @@ and [Wallenius' distribution](https://docs.scipy.org/doc/scipy/reference/generat
   `10u64.pow(precision)` in
   [`with_precision_and_capacity`](src/lib.rs#L183), too.
 
-- [ ] **Return Python exceptions instead of Rust panics.**
+- [x] **Return Python exceptions instead of Rust panics.**
   [`with_precision`](src/lib.rs#L1373) uses `try_into().unwrap()`, and all Python
   constructors eventually hit Rust assertions for precision outside `1..=9`.
   Return `PyResult<Self>` with `ValueError`; do the same for invalid IDs, weights,
   and overflow once those APIs report errors. Add Python tests for `-1`, `0`,
   `10`, `256`, invalid weights, and oversized IDs.
 
-- [ ] **Protect tree invariants from external mutation.** The generic type
+- [x] **Protect tree invariants from external mutation.** The generic type
   exposes [`root` and `precision`](src/lib.rs#L699), and `Node` exposes its
   content and aggregates. A caller can change precision without updating
   `scale`, or alter counts independently of bins. Make invariant-bearing fields
@@ -110,7 +110,7 @@ and [Wallenius' distribution](https://docs.scipy.org/doc/scipy/reference/generat
   per batch; expose their RNG-aware variants publicly if replayable Fisher draws
   are needed.
 
-- [ ] **Verify source-distribution and local Python builds enable the binding
+- [x] **Verify source-distribution and local Python builds enable the binding
   feature.** Wheel jobs pass `--features python-bindings` explicitly in
   [CI](.github/workflows/maturin.yml#L48), but [pyproject.toml](pyproject.toml)
   has no `[tool.maturin] features` setting and the sdist job does not pass the
@@ -138,7 +138,7 @@ and [Wallenius' distribution](https://docs.scipy.org/doc/scipy/reference/generat
   boxed ten-child internal node only to discard it immediately when creating a
   new leaf.
 
-- [ ] **Either implement real batch insertion/removal or correct the claims.**
+- [x] **Either implement real batch insertion/removal or correct the claims.**
   Despite documentation saying inputs are grouped and each path is traversed
   once, [`add_many`](src/lib.rs#L801) and
   [`remove_many`](src/lib.rs#L873) simply call the recursive single-item path in
@@ -147,14 +147,14 @@ and [Wallenius' distribution](https://docs.scipy.org/doc/scipy/reference/generat
   `remove_many` is partially mutating and returns `true` only when every removal
   succeeds.
 
-- [ ] **Prune empty branches after successful removals.**
+- [x] **Prune empty branches after successful removals.**
   [`remove_recurse`](src/lib.rs#L847) updates aggregates but never sets an empty
   child back to `None`; selection removal has the same behavior. Memory and
   traversal cost therefore follow every weight path ever observed, not the
   current population. Prune while unwinding and add a churn test that inserts
   and removes many distinct weight paths.
 
-- [ ] **Revisit backend selection for skewed weight distributions.**
+- [x] **Revisit backend selection for skewed weight distributions.**
   [`with_precision_and_capacity`](src/lib.rs#L183) chooses storage from average
   `capacity / 10^precision`. A million same-weight items at precision 3 still
   select `Vec<u32>` at the threshold, creating a million-element leaf with
@@ -169,7 +169,7 @@ and [Wallenius' distribution](https://docs.scipy.org/doc/scipy/reference/generat
   traversal work. Balanced, skewed, near-full, and precision-5 stress benchmarks
   remain in the Criterion suite for measurement on a Rust-equipped machine.
 
-- [ ] **Correct diagnostics and benchmark accounting.** `print_stats` counts
+- [x] **Correct diagnostics and benchmark accounting.** `print_stats` counts
   each child node both in its parent's boxed array and again during traversal,
   and estimates every leaf as `bin_size * size_of::<u32>()`, including
   `RoaringTreemap`; see [the memory accounting](src/lib.rs#L1230). The Python
@@ -184,7 +184,7 @@ and [Wallenius' distribution](https://docs.scipy.org/doc/scipy/reference/generat
 - [x] Add a CI job for `cargo test --all-features`, including doctests and the
   exact Fisher distribution regressions.
 
-- [ ] Add CI jobs for `cargo fmt --check`, `cargo clippy --all-targets
+- [x] Add CI jobs for `cargo fmt --check`, `cargo clippy --all-targets
   --all-features -- -D warnings`, and Python smoke/behavior tests against built
   wheels. The wheel jobs still build artifacts without importing the extension.
 
@@ -193,14 +193,37 @@ and [Wallenius' distribution](https://docs.scipy.org/doc/scipy/reference/generat
   mean to `585.829`, and update the Wallenius mean to `618.050`. Add deterministic
   uniqueness, complement-removal, and aggregate-preservation tests.
 
-- [ ] Turn `test_add_many` into an invariant comparison with assertions, and add
+- [x] Turn `test_add_many` into an invariant comparison with assertions, and add
   cross-backend tests for add/remove parity, wrong-weight removal, zero draws,
   duplicates, ID boundaries, and aggregate consistency after every mutation.
 
-- [ ] Reconcile public documentation with behavior: `add` returns `()`, not
+- [x] Reconcile public documentation with behavior: `add` returns `()`, not
   `bool`; `count` returns `u64`, not `u32`; accepted weights are currently
   `(0, 1)` after quantization; `remove_many` is not atomic; the blanket `O(P)`
   claim excludes linear `Vec` removal and exact Fisher batch work in B occupied
   bins; and
   [README.md](README.md#L192) says Python 3.6+ while
   [pyproject.toml](pyproject.toml#L10) requires Python 3.8+.
+
+## Resolution notes (2026-08-10)
+
+- Small and Medium now reject IDs above `u32::MAX`; Large supports all `u64`
+  IDs. A global Roaring membership set enforces uniqueness across weight paths.
+- Mutations return `Result`. Weights must be finite and in `(0, 1)` and are
+  rounded to the nearest bin with positive boundary clamping. Aggregate growth
+  is checked before mutation, and invariant-bearing tree fields are private.
+- Python constructors validate signed precision and mutations raise typed Python
+  exceptions. Both a local ABI3 wheel and an isolated sdist installation pass
+  the Python behavior suite.
+- `add_many` uses atomic whole-batch validation followed by per-item radix
+  traversal; the unsupported grouping claim was removed. `remove_many` documents
+  ordered partial mutation and returns true only when every removal succeeds.
+- All removal paths prune empty branches. Backend guidance and Criterion now
+  include a 100,000-item single-bin Small/Medium comparison.
+- Diagnostics no longer double-count child nodes, use backend-specific bin
+  estimates, and include the global ID set. Python RSS measurement runs in a
+  fresh process without retaining input data.
+- CI now checks formatting, all-target/all-feature Clippy, all-feature tests,
+  a built native wheel, Python behavior, and an installed sdist. Rust and Python
+  tests cover IDs, duplicates, invalid weights, overflow, wrong-weight removal,
+  zero draws, pruning, batch parity, and aggregate invariants.

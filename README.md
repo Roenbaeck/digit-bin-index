@@ -17,7 +17,7 @@ In simulations, forecasts, or statistical models (e.g., [mortality models](https
 
 1.  **Digit-based Tree Structure**: Each level of the tree corresponds to a decimal place of the rescaled weight. For example, a weight of `0.543` at precision 3 is rescaled to `543` and placed by traversing the path: `root -> child[5] -> child[4] -> child[3]`.
 
-2.  **Adaptive Bin Storage**: Leaf nodes act as bins, storing item IDs in either a fast `Vec<u32>` (for small bins) or a compressed [Roaring Bitmap](https://roaringbitmap.org/) (for large bins). The bin type is chosen automatically for optimal performance and memory use if a capacity hint is given.
+2.  **Selectable Bin Storage**: Leaf nodes store IDs in `Vec<u32>`, `RoaringBitmap`, or `RoaringTreemap`. A capacity hint selects a backend from expected average occupancy; explicitly choose a backend for highly skewed weights or when full `u64` IDs are required.
 
 3.  **Accumulated Value Index**: Each node tracks the `accumulated_value` (sum of weights beneath it), supporting O(P) weighted random selection, where P is the configured precision (number of decimal places).
 
@@ -25,13 +25,13 @@ In simulations, forecasts, or statistical models (e.g., [mortality models](https
 
 5.  **Persistent Sequential Sampling**: Each index seeds a fast `WyRand` generator once and reuses it for sequential convenience methods. Rust callers can provide their own generator through `select_with_rng` and `select_and_remove_with_rng`. `select_wallenius_many_and_remove` performs many sequential removals in one call, avoiding repeated Python/Rust boundary crossings while preserving Wallenius' law.
 
-6.  **Mass-Optimal Child Scans**: Internal nodes keep direct digit lookup for updates and a separate scan order sorted by descending accumulated mass. Since child selection probability is proportional to that mass, this order minimizes expected probes for a linear scan. A mutation changes only one child per level, so bounded local swaps restore the optimal order.
+6.  **Lazy Mass-Optimal Child Scans**: Internal nodes keep direct digit lookup for updates and a separate scan order sorted by descending accumulated mass. Mutations invalidate ordering cheaply; only nodes reached by a later selection sort their at-most-ten active children. Selection removals maintain the visited path locally.
 
 ### Features
 
 *   **High Performance**: Outperforms general-purpose data structures like Fenwick Trees for both sequential and simultaneous weighted sampling.
 *   **Dual-Model Support**: Optimized sequential Wallenius draws (`select_and_remove`) and exact Fisher draws over quantized weights (`select_many_and_remove`).
-*   **O(P) Complexity**: Core operations (add, remove, select) have a time complexity of O(P), where P is the fixed precision, effectively constant for a given configuration.
+*   **Bounded Tree Traversal**: Radix traversal is O(P), where P is the fixed precision. Explicit `Vec`-leaf removal is linear in that leaf's occupancy, and exact Fisher batches also depend on occupied bins.
 *   **Memory Efficiency**: Combines a sparse radix tree with Roaring Bitmaps for efficient storage, especially for sparse or clustered weight distributions.
 *   **Python Integration**: Seamless Python bindings via `pyo3` for cross-language support.
 
@@ -70,7 +70,7 @@ These are historical v0.4.2 measurements. The current implementation reuses RNG 
 Batch sampling now implements the exact Fisher law for the quantized weights. It uses two adaptive engines:
 
 *   **Small samples**: weighted item proposals conditioned on uniqueness. Expected work is close to O(kP) while collision probability is low.
-*   **Larger samples**: conditional binomial sampling over the B occupied weight bins, followed by uniform sampling within each selected bin. Runtime depends on B rather than the population size N. Draws over half the population sample the smaller complement with reciprocal weights.
+*   **Larger samples**: conditional binomial sampling over the B occupied weight bins, followed by uniform sampling within each selected bin. High-bin-count workloads use partial convolution blocks so each exact-sum proposal samples block totals rather than every individual bin. Runtime depends on B rather than population size N. Draws over half the population sample the smaller complement with reciprocal weights.
 
 The previous Fisher timing table measured the earlier capped-multinomial approximation and is not comparable to the exact implementation. The Criterion suite retains 1M and 10M batch scenarios at precision 3 and 5; updated numbers should be published after benchmarking the exact sampler on the documented hardware. Precision 3 has at most 999 positive-weight bins and is expected to remain the strongest large-batch configuration. High precision with many occupied bins is intentionally covered as a stress case.
 
@@ -106,7 +106,7 @@ Each decimal place contributes exponentially less to a weight’s value. For a w
 *   3rd digit (`3`): `0.003`
 *   4th digit (`4`): `0.0004`
 
-Truncating at 3 digits limits the error per item to <0.001. In large populations, these errors average out, minimally affecting the selection distribution.
+Rounding to 3 digits limits the error per item to at most 0.0005, except at the positive boundaries where values are clamped to the smallest or largest representable bin.
 
 #### Guidance
 
@@ -118,31 +118,51 @@ Truncating at 3 digits limits the error per item to <0.001. In large populations
 
 ---
 
+### Mutation Contract and Capacity
+
+Weights must be finite and strictly between zero and one. Rust mutation methods
+return `Result`; Python raises `ValueError` for invalid weights and duplicates,
+and `OverflowError` for an ID that does not fit the selected backend. Batch
+addition validates the complete input before changing the tree. Batch removal
+is ordered and partially mutating when a valid `(ID, weight)` pair is missing.
+
+Counts and scaled-weight sums use `u64` and are checked before growth. At
+precision 9, repeatedly adding weights near one reaches the scaled-mass limit at
+roughly 18.4 billion items; the insertion that would exceed the limit returns an
+error rather than wrapping.
+
+---
+
 ## Internal Storage and Capacity
 
 The `DigitBinIndex` is designed to handle a vast range of use cases, from a few thousand items to trillions, by automatically selecting the most appropriate internal storage engine.
 
 ### Item Capacity
 
-The index accepts **`u64`** for individual item IDs. However, the internal storage of these IDs depends on the backend chosen. 
+The index accepts **`u64`** item IDs. `Small` and `Medium` return an error for IDs above `u32::MAX`; `Large` supports the complete `u64` range. IDs are unique across the complete index, including across different weight bins.
 
 To provide the best balance of performance and memory usage, the library's `DigitBinIndex` is an enum that automatically switches between three different backends (`Small`, `Medium`, and `Large`) when you use the `with_precision_and_capacity()` constructor or the explicit constructors `small()`, `medium()`, and `large()`.
 
 The selection is based on a simple heuristic: the **average number of items expected per bin**, which is calculated as `capacity / 10^precision`.
+
+The capacity hint cannot infer ID width or weight skew. Use `large` whenever an
+ID may exceed `u32::MAX`. If many items share a small number of weights, compare
+`small` and `medium` with representative data; the Criterion suite includes a
+single-bin backend benchmark for this case.
 
 1.  `Small` (**`Vec<u32>`**):
     *   **Constructor:** `small(precision: u8)`.
     *   **Backend Datatype:** `u32` (max 4 billion).
     *   **Capacity Trigger:** Low average items per bin (<= 1,000).
     *   **Best for:** Small to medium-sized problems where `select_and_remove` speed is the absolute priority (O(1) `swap_remove`).
-    *   ***Warning:*** Truncates `u64` IDs. `remove_many` can be O(N) per bin.
+    *   ***Warning:*** Rejects IDs above `u32::MAX`. Explicit removal is linear in the selected leaf's occupancy.
 
 2.  `Medium` (**`RoaringBitmap`**):
     *   **Constructor:** `medium(precision: u8)`.
     *   **Backend Datatype:** `u32` (max 4 billion).
     *   **Capacity Trigger:** Medium to large average items per bin (> 1,000).
-    *   **Best for:** Large-scale problems (millions to billions of items) where IDs fit within `u32`. Provides excellent memory compression and fast set operations (including `remove_many`).
-    *   ***Warning:*** Truncates `u64` IDs.
+    *   **Best for:** Large-scale problems where IDs fit within `u32`, especially heavily occupied or clustered bins.
+    *   ***Warning:*** Rejects IDs above `u32::MAX`.
 
 3.  `Large` (**`RoaringTreemap`**):
     *   **Constructor:** `large(precision: u8)`.
@@ -164,7 +184,7 @@ let index = DigitBinIndex::with_precision_and_capacity(3, 100_000);
 ```
 
 *   **Calculation:** The number of bins is `10^3 = 1,000`. The average items per bin is `100,000 / 1,000 = 100`.
-*   **Result:** Since 100 <= 1,000, the `Small` variant is chosen. This provides the fastest O(1) `select_and_remove` performance. (This would truncate `u64` IDs).
+*   **Result:** Since 100 <= 1,000, the `Small` variant is chosen. IDs above `u32::MAX` will be rejected rather than truncated.
 
 #### Example 2: `Medium (RoaringBitmap)` is Chosen
 
@@ -176,7 +196,7 @@ let index = DigitBinIndex::with_precision_and_capacity(3, 50_000_000);
 ```
 
 *   **Calculation:** The average items per bin is `50,000,000 / 1,000 = 50,000`.
-*   **Result:** This is > 1,000. The `Medium` variant is selected, using `RoaringBitmap`. This will be highly memory-efficient and very fast for all operations, including `remove_many`. (This would also truncate `u64` IDs).
+*   **Result:** This is > 1,000. The `Medium` variant is selected, using `RoaringBitmap`; IDs above `u32::MAX` will be rejected.
 
 #### Example 3: `Large (RoaringTreemap)` is Chosen
 
@@ -194,7 +214,7 @@ let index = DigitBinIndex::with_precision_and_capacity(3, 5_000_000_000_000);
 
 ### Usage & Installation
 
-`DigitBinIndex` is available as a Python library on [PyPI](https://pypi.org/project/digit-bin-index/) or as a Rust crate on [Crates.io](https://crates.io/crates/digit-bin-index). Ensure Python 3.6+ for Python bindings or Rust 1.75+ for the Rust crate.
+`DigitBinIndex` is available as a Python library on [PyPI](https://pypi.org/project/digit-bin-index/) or as a Rust crate on [Crates.io](https://crates.io/crates/digit-bin-index). The Python bindings require Python 3.8+.
 
 #### For Python 🐍
 
@@ -264,15 +284,15 @@ Example usage:
 ```rust
 use digit_bin_index::DigitBinIndex;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create an index with precision 3.
     let mut index = DigitBinIndex::with_precision(3);
 
     // Add items with IDs and f64 weights.
-    index.add(101, 0.123); // Low weight
-    index.add(202, 0.800); // High weight
-    index.add(303, 0.755); // High weight
-    index.add(404, 0.110); // Low weight
+    index.add(101, 0.123)?; // Low weight
+    index.add(202, 0.800)?; // High weight
+    index.add(303, 0.755)?; // High weight
+    index.add(404, 0.110)?; // Low weight
 
     // Sequential (Wallenius') Draw: Select and remove one item.
     if let Some((id, weight)) = index.select_and_remove() {
@@ -288,6 +308,7 @@ fn main() {
         println!("Fisher's draw: {:?}", items);
     }
     println!("Items remaining: {}", index.count()); // 1
+    Ok(())
 }
 ```
 
