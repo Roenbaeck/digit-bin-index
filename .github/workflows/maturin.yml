@@ -19,6 +19,14 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run Rust tests
+        run: cargo test --all-features
+
   linux:
     runs-on: ${{ matrix.platform.runner }}
     strategy:

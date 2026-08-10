@@ -13,6 +13,7 @@ categories = ["data-structures", "algorithms", "science", "simulation"]
 [dependencies]
 wyrand = "0.3"
 rand = "0.9" 
+rand_distr = "0.5"
 roaring = "0.11"
 
 [dependencies.pyo3]

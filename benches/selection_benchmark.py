@@ -65,8 +65,12 @@ for i in range({num_items_to_test}):
     select_time = timeit.timeit(stmt=select_stmt, setup=setup_code_select, number=number_of_runs_single)
     print(f"{number_of_runs_single:,} single selections: {select_time:.6f} seconds")
 
+    # --- Benchmark: sequential Wallenius batch ---
+    wallenius_batch_stmt = f"index.select_wallenius_many_and_remove({number_of_runs_single})"
+    wallenius_batch_time = timeit.timeit(stmt=wallenius_batch_stmt, setup=setup_code_select, number=1)
+    print(f"One Wallenius batch of {number_of_runs_single:,}: {wallenius_batch_time:.6f} seconds")
 
-    # --- Benchmark: select_many_and_remove ---
+    # --- Benchmark: simultaneous Fisher batches ---
     number_of_runs_many = 1_000
     select_many_stmt = "index.select_many_and_remove(100)"
     select_many_time = timeit.timeit(stmt=select_many_stmt, setup=setup_code_select, number=number_of_runs_many)

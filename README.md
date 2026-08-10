@@ -21,10 +21,16 @@ In simulations, forecasts, or statistical models (e.g., [mortality models](https
 
 3.  **Accumulated Value Index**: Each node tracks the `accumulated_value` (sum of weights beneath it), supporting O(P) weighted random selection, where P is the configured precision (number of decimal places).
 
+4.  **Adaptive Exact Fisher Sampling**: Batch draws operate on occupied weight bins rather than expanding the population. Small draws use weighted proposals conditioned on all IDs being unique. Larger draws sample exponentially tilted binomial counts for each occupied bin and condition their sum on the requested sample size. Both paths produce Fisher's noncentral hypergeometric law for the quantized weights.
+
+5.  **Persistent Sequential Sampling**: Each index seeds a fast `WyRand` generator once and reuses it for sequential convenience methods. Rust callers can provide their own generator through `select_with_rng` and `select_and_remove_with_rng`. `select_wallenius_many_and_remove` performs many sequential removals in one call, avoiding repeated Python/Rust boundary crossings while preserving Wallenius' law.
+
+6.  **Mass-Optimal Child Scans**: Internal nodes keep direct digit lookup for updates and a separate scan order sorted by descending accumulated mass. Since child selection probability is proportional to that mass, this order minimizes expected probes for a linear scan. A mutation changes only one child per level, so bounded local swaps restore the optimal order.
+
 ### Features
 
 *   **High Performance**: Outperforms general-purpose data structures like Fenwick Trees for both sequential and simultaneous weighted sampling.
-*   **Dual-Model Support**: Optimized methods for Wallenius' (`select_and_remove`) and Fisher's (`select_many_and_remove`) distributions.
+*   **Dual-Model Support**: Optimized sequential Wallenius draws (`select_and_remove`) and exact Fisher draws over quantized weights (`select_many_and_remove`).
 *   **O(P) Complexity**: Core operations (add, remove, select) have a time complexity of O(P), where P is the fixed precision, effectively constant for a given configuration.
 *   **Memory Efficiency**: Combines a sparse radix tree with Roaring Bitmaps for efficient storage, especially for sparse or clustered weight distributions.
 *   **Python Integration**: Seamless Python bindings via `pyo3` for cross-language support.
@@ -55,19 +61,18 @@ This benchmark simulates sequential selection by removing 100,000 items one-by-o
 
 *   **Key Takeaway**: `DigitBinIndex` is **over 3.0 times faster** than the `FenwickTree` for sequential operations on large datasets. Its performance is dependent on precision (`P`) and not the number of items (`N`), allowing it to scale far more effectively.
 
+These are historical v0.4.2 measurements. The current implementation reuses RNG state, propagates integer weights through the hot path, removes runtime selection/removal branching, and scans children in descending accumulated-mass order. Updated numbers should replace this table after rerunning the Criterion suite on the documented hardware. The suite now includes a heavily skewed workload whose dominant mass occupies a low-digit branch.
+
 ---
 
 #### Fisher's Draw (Batch Churn)
 
-This benchmark simulates simultaneous selection by removing a large batch of 100,000 unique items at once, followed by the acquisition of 110,000 new items. `DigitBinIndex` uses a highly optimized batch rejection sampling method.
+Batch sampling now implements the exact Fisher law for the quantized weights. It uses two adaptive engines:
 
-| Scenario (N items)         | `DigitBinIndex` Time | `FenwickTree` Time | **Speedup Factor** |
-| :------------------------- | :------------------- | :----------------- | :----------------- |
-| **1 Million Items** (p=3)  | **~19.5 ms**         | ~104.2 ms          | **~5.3x faster**   |
-| **1 Million Items** (p=5)  | **~39.9 ms**         | ~106.6 ms          | **~2.7x faster**   |
-| **10 Million Items** (p=3) | **~389.0 ms**        | ~1649.9 ms         | **~4.2x faster**   |
+*   **Small samples**: weighted item proposals conditioned on uniqueness. Expected work is close to O(kP) while collision probability is low.
+*   **Larger samples**: conditional binomial sampling over the B occupied weight bins, followed by uniform sampling within each selected bin. Runtime depends on B rather than the population size N. Draws over half the population sample the smaller complement with reciprocal weights.
 
-**Key Takeaway**: For batch selections, `DigitBinIndex` is even more efficient, performing **up to 5.3 times faster**. The batched nature of the operation further highlights the architectural advantages of the radix tree approach for this use case.
+The previous Fisher timing table measured the earlier capped-multinomial approximation and is not comparable to the exact implementation. The Criterion suite retains 1M and 10M batch scenarios at precision 3 and 5; updated numbers should be published after benchmarking the exact sampler on the documented hardware. Precision 3 has at most 999 positive-weight bins and is expected to remain the strongest large-batch configuration. High precision with many occupied bins is intentionally covered as a stress case.
 
 ---
 
@@ -231,6 +236,9 @@ def main():
     
     print(f"Items remaining: {index.count()}")  # 3
 
+    # For many sequential Wallenius draws, use one native batch call:
+    # churned_items = index.select_wallenius_many_and_remove(100_000)
+
     # Simultaneous (Fisher's) Draw: Select and remove 2 unique items.
     selected_items = index.select_many_and_remove(2)
     if selected_items:
@@ -271,6 +279,9 @@ fn main() {
         println!("Wallenius draw: ID {}, Weight ~{}", id, weight);
     }
     println!("Items remaining: {}", index.count()); // 3
+
+    // For repeated sequential draws, reuse the index RNG in one call:
+    // let churned_items = index.select_wallenius_many_and_remove(100_000);
 
     // Simultaneous (Fisher's) Draw: Select and remove 2 unique items.
     if let Some(items) = index.select_many_and_remove(2) {

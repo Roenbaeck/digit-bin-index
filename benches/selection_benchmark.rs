@@ -96,7 +96,7 @@ impl WeightedSelector {
         Some((id, weight))
     }
 
-    // --- CORRECTED FISHER'S DRAW (Systematic PPS Sampling) ---
+    // --- Comparison baseline: systematic PPS sampling (not Fisher's law) ---
     pub fn select_many_and_remove<R: Rng>(&mut self, num_to_draw: u32, rng: &mut R) -> Option<Vec<(u32, f64)>> {
         let num_to_draw = num_to_draw as usize;
         let current_pop_size = self.id_to_index.len();
@@ -173,7 +173,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
             for i in 0..INITIAL_POP { dbi.add(i as u64, rng.random_range(0.001..0.999)); }
             (dbi, INITIAL_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
-            for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove()); }
+            for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove_with_rng(&mut rng)); }
             for _ in 0..ACQUISITION_COUNT {
                 dbi.add(next_id, rng.random_range(0.001..0.999));
                 next_id += 1;
@@ -203,7 +203,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
             for i in 0..INITIAL_POP { dbi.add(i as u64, rng.random_range(0.00001..0.99999)); }
             (dbi, INITIAL_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
-            for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove()); }
+            for _ in 0..CHURN_COUNT { black_box(dbi.select_and_remove_with_rng(&mut rng)); }
             for _ in 0..ACQUISITION_COUNT {
                 dbi.add(next_id, rng.random_range(0.00001..0.99999));
                 next_id += 1;
@@ -237,7 +237,7 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
             }
             (dbi, VERY_LARGE_POP as u64, rng)
         }, |(mut dbi, mut next_id, mut rng)| {
-            for _ in 0..VERY_LARGE_CHURN { black_box(dbi.select_and_remove()); }
+            for _ in 0..VERY_LARGE_CHURN { black_box(dbi.select_and_remove_with_rng(&mut rng)); }
             for _ in 0..VERY_LARGE_ACQ {
                 dbi.add(next_id, rng.random_range(0.001..0.999));
                 next_id += 1;
@@ -265,8 +265,53 @@ fn benchmark_wallenius_simulation(c: &mut Criterion) {
     group.finish();
 }
 
+fn benchmark_skewed_wallenius_simulation(c: &mut Criterion) {
+    const HIGH_WEIGHT_ITEMS: u64 = INITIAL_POP / 1_000;
+    const LOW_WEIGHT_ITEMS: u64 = INITIAL_POP - HIGH_WEIGHT_ITEMS;
+
+    let mut group = c.benchmark_group("Wallenius Simulation (Skewed Low-Digit Mass)");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(CHURN_COUNT));
+
+    group.bench_function(BenchmarkId::new("DigitBinIndex (mass ordered)", INITIAL_POP), |b| {
+        b.iter_batched(|| {
+            let mut index = DigitBinIndex::with_precision_and_capacity(3, INITIAL_POP);
+            for id in 0..LOW_WEIGHT_ITEMS {
+                index.add(id, 0.099);
+            }
+            for id in LOW_WEIGHT_ITEMS..INITIAL_POP {
+                index.add(id, 0.999);
+            }
+            (index, WyRand::from_os_rng())
+        }, |(mut index, mut rng)| {
+            for _ in 0..CHURN_COUNT {
+                black_box(index.select_and_remove_with_rng(&mut rng));
+            }
+        }, criterion::BatchSize::SmallInput);
+    });
+
+    group.bench_function(BenchmarkId::new("WeightedSelector (FenwickTree)", INITIAL_POP), |b| {
+        b.iter_batched(|| {
+            let mut selector = WeightedSelector::new(INITIAL_POP as usize);
+            for id in 0..LOW_WEIGHT_ITEMS {
+                selector.add(id as u32, 0.099).unwrap();
+            }
+            for id in LOW_WEIGHT_ITEMS..INITIAL_POP {
+                selector.add(id as u32, 0.999).unwrap();
+            }
+            (selector, WyRand::from_os_rng())
+        }, |(mut selector, mut rng)| {
+            for _ in 0..CHURN_COUNT {
+                black_box(selector.select_and_remove(&mut rng));
+            }
+        }, criterion::BatchSize::SmallInput);
+    });
+
+    group.finish();
+}
+
 fn benchmark_fisher_simulation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Fisher Simulation (Batch Churn)");
+    let mut group = c.benchmark_group("Exact Fisher Simulation (Batch Churn)");
     group.throughput(Throughput::Elements((CHURN_COUNT + ACQUISITION_COUNT) as u64));
 
     group.bench_function(BenchmarkId::new("DigitBinIndex (precision 3)", INITIAL_POP), |b| {
@@ -284,7 +329,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
         }, criterion::BatchSize::SmallInput);
     });
 
-    group.bench_function(BenchmarkId::new("WeightedSelector (precision 3)", INITIAL_POP), |b| {
+    group.bench_function(BenchmarkId::new("Systematic PPS baseline (precision 3)", INITIAL_POP), |b| {
         b.iter_batched(|| {
             let mut selector = WeightedSelector::new(MAX_CAPACITY as usize);
             let mut rng = WyRand::from_os_rng();
@@ -314,7 +359,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
         }, criterion::BatchSize::SmallInput);
     });
 
-    group.bench_function(BenchmarkId::new("WeightedSelector (precision 5)", INITIAL_POP), |b| {
+    group.bench_function(BenchmarkId::new("Systematic PPS baseline (precision 5)", INITIAL_POP), |b| {
         b.iter_batched(|| {
             let mut selector = WeightedSelector::new(MAX_CAPACITY as usize);
             let mut rng = WyRand::from_os_rng();
@@ -348,7 +393,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
         }, criterion::BatchSize::SmallInput);
     });
 
-    group.bench_function(BenchmarkId::new("WeightedSelector (very large, FenwickTree)", VERY_LARGE_POP), |b| {
+    group.bench_function(BenchmarkId::new("Systematic PPS baseline (very large, FenwickTree)", VERY_LARGE_POP), |b| {
         b.iter_batched(|| {
             let mut selector = WeightedSelector::new(VERY_LARGE_MAX as usize);
             let mut rng = WyRand::from_os_rng();
@@ -459,115 +504,9 @@ fn insertion_benchmark(c: &mut Criterion) {
 
 criterion_group!(
         benches, 
-        benchmark_wallenius_simulation, 
+    benchmark_wallenius_simulation,
+    benchmark_skewed_wallenius_simulation,
         benchmark_fisher_simulation,
         insertion_benchmark
 );
 criterion_main!(benches);
-
-/*
-// --- Statistical Validation Tests ---
-// Commented since they confised cargo, and not really necessary now that 
-// desired functionality is confirmed. Can be uncommented for future reference.
-#[cfg(test)]
-mod tests {
-    use super::*; // Import parent module's items like WeightedSelector
-
-    #[test]
-    fn test_weighted_selector_wallenius_distribution() {
-        // --- Setup: Create a controlled population ---
-        const ITEMS_PER_GROUP: u32 = 1000;
-        const TOTAL_ITEMS: u32 = ITEMS_PER_GROUP * 2;
-        const NUM_DRAWS: u32 = TOTAL_ITEMS / 2;
-
-        let low_risk_weight = 0.1f64;
-        let high_risk_weight = 0.2f64;
-
-        // --- Execution: Run many simulations to average out randomness ---
-        const NUM_SIMULATIONS: u32 = 100;
-        let mut total_high_risk_selected = 0;
-
-        for _ in 0..NUM_SIMULATIONS {
-            let mut selector = WeightedSelector::new(TOTAL_ITEMS as usize);
-            for i in 0..ITEMS_PER_GROUP { selector.add(i, low_risk_weight).unwrap(); }
-            for i in ITEMS_PER_GROUP..TOTAL_ITEMS { selector.add(i, high_risk_weight).unwrap(); }
-
-            let mut high_risk_in_this_run = 0;
-            let mut rng = WyRand::from_os_rng();
-            for _ in 0..NUM_DRAWS {
-                if let Some((selected_id, _)) = selector.select_and_remove(&mut rng) {
-                    if selected_id >= ITEMS_PER_GROUP {
-                        high_risk_in_this_run += 1;
-                    }
-                }
-            }
-            total_high_risk_selected += high_risk_in_this_run;
-        }
-
-        // --- Validation: Check against theoretical means ---
-        let avg_high_risk = total_high_risk_selected as f64 / NUM_SIMULATIONS as f64;
-        let uniform_mean = NUM_DRAWS as f64 * 0.5;
-        let fishers_mean = NUM_DRAWS as f64 * (2.0 / 3.0); // Based on initial weight ratio 0.2 / (0.1 + 0.2)
-
-        assert!(
-            avg_high_risk > uniform_mean,
-            "Wallenius test failed: Result {:.2} was not biased towards higher weights (uniform mean is {:.2})",
-            avg_high_risk, uniform_mean
-        );
-
-        assert!(
-            avg_high_risk < fishers_mean,
-            "Wallenius test failed: Result {:.2} showed too much bias. It should be less than the Fisher's mean of {:.2}.",
-            avg_high_risk, fishers_mean
-        );
-        
-        println!(
-            "WeightedSelector Wallenius test passed: Avg high-risk selections {:.2} is between uniform mean ({:.2}) and Fisher's mean ({:.2}).",
-            avg_high_risk, uniform_mean, fishers_mean
-        );
-    }
-
-    #[test]
-    fn test_weighted_selector_fisher_distribution() {
-        // --- Setup: Create a controlled population ---
-        const ITEMS_PER_GROUP: u32 = 1000;
-        const TOTAL_ITEMS: u32 = ITEMS_PER_GROUP * 2;
-        const NUM_DRAWS: u32 = TOTAL_ITEMS / 2;
-
-        let low_risk_weight = 0.1f64;
-        let high_risk_weight = 0.2f64;
-
-        // --- Execution: Run many simulations ---
-        const NUM_SIMULATIONS: u32 = 100;
-        let mut total_high_risk_selected = 0;
-
-        for _ in 0..NUM_SIMULATIONS {
-            let mut selector = WeightedSelector::new(TOTAL_ITEMS as usize);
-            for i in 0..ITEMS_PER_GROUP { selector.add(i, low_risk_weight).unwrap(); }
-            for i in ITEMS_PER_GROUP..TOTAL_ITEMS { selector.add(i, high_risk_weight).unwrap(); }
-            
-            let mut rng = WyRand::from_os_rng();
-            if let Some(selected_items) = selector.select_many_and_remove(NUM_DRAWS, &mut rng) {
-                let high_risk_in_this_run = selected_items.iter().filter(|&&(id, _)| id >= ITEMS_PER_GROUP).count();
-                total_high_risk_selected += high_risk_in_this_run as u32;
-            }
-        }
-        
-        // --- Validation: Check against theoretical mean ---
-        let avg_high_risk = total_high_risk_selected as f64 / NUM_SIMULATIONS as f64;
-        let fishers_mean = NUM_DRAWS as f64 * (2.0 / 3.0);
-        let tolerance = fishers_mean * 0.02; // Allow 5% tolerance for statistical noise
-
-        assert!(
-            (avg_high_risk - fishers_mean).abs() < tolerance,
-            "Fisher's test failed: Result {:.2} was not close enough to the expected mean of {:.2} (tolerance {:.2})",
-            avg_high_risk, fishers_mean, tolerance
-        );
-        
-        println!(
-            "WeightedSelector Fisher's test passed: Got avg {:.2} high-risk selections (expected ~{:.2}).",
-            avg_high_risk, fishers_mean
-        );
-    }
-}
-*/
