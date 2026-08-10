@@ -54,6 +54,42 @@ class DigitBinIndexPythonTests(unittest.TestCase):
         self.assertEqual({item_id for item_id, _ in selected}, {2, 3})
         self.assertEqual(index.count(), 0)
 
+    def test_pps_sampling_is_unique_and_handles_certainty_items(self):
+        index = DigitBinIndex.with_precision(2)
+        index.add(0, 0.9)
+        index.add_many([(item_id, 0.01) for item_id in range(1, 11)])
+
+        selected = index.select_pps_many(2)
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(len({item_id for item_id, _ in selected}), 2)
+        self.assertIn(0, {item_id for item_id, _ in selected})
+        self.assertEqual(index.count(), 11)
+
+        removed = index.select_pps_many_and_remove(2)
+        self.assertEqual(len(removed), 2)
+        self.assertIn(0, {item_id for item_id, _ in removed})
+        self.assertEqual(index.count(), 9)
+
+    def test_bernoulli_sampling_has_random_size_and_optional_removal(self):
+        index = DigitBinIndex.with_precision(2)
+        index.add_many(
+            [(item_id, (0.1, 0.5, 0.9)[item_id % 3]) for item_id in range(30)]
+        )
+
+        selected = index.select_bernoulli_many()
+        self.assertIsInstance(selected, list)
+        self.assertEqual(len({item_id for item_id, _ in selected}), len(selected))
+        self.assertEqual(index.count(), 30)
+
+        removed = index.select_bernoulli_many_and_remove()
+        self.assertIsInstance(removed, list)
+        self.assertEqual(len({item_id for item_id, _ in removed}), len(removed))
+        self.assertEqual(index.count(), 30 - len(removed))
+
+        empty = DigitBinIndex.with_precision(2)
+        self.assertEqual(empty.select_bernoulli_many(), [])
+        self.assertEqual(empty.select_bernoulli_many_and_remove(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

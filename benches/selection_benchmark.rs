@@ -447,7 +447,10 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
     );
 
     group.bench_function(
-        BenchmarkId::new("Systematic PPS baseline (precision 3)", INITIAL_POP),
+        BenchmarkId::new(
+            "Systematic PPS comparison (not Fisher, precision 3)",
+            INITIAL_POP,
+        ),
         |b| {
             b.iter_batched(
                 || {
@@ -500,7 +503,10 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
     );
 
     group.bench_function(
-        BenchmarkId::new("Systematic PPS baseline (precision 5)", INITIAL_POP),
+        BenchmarkId::new(
+            "Systematic PPS comparison (not Fisher, precision 5)",
+            INITIAL_POP,
+        ),
         |b| {
             b.iter_batched(
                 || {
@@ -555,7 +561,7 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
 
     group.bench_function(
         BenchmarkId::new(
-            "Systematic PPS baseline (very large, FenwickTree)",
+            "Systematic PPS comparison (not Fisher, very large FenwickTree)",
             VERY_LARGE_POP,
         ),
         |b| {
@@ -583,6 +589,124 @@ fn benchmark_fisher_simulation(c: &mut Criterion) {
             );
         },
     );
+
+    group.finish();
+}
+
+fn benchmark_pps_simulation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Fixed-Size PPS Simulation (Batch Churn)");
+    group.throughput(Throughput::Elements(CHURN_COUNT + ACQUISITION_COUNT));
+
+    for precision in [3, 5] {
+        group.bench_function(
+            BenchmarkId::new(
+                format!("DigitBinIndex (precision {precision})"),
+                INITIAL_POP,
+            ),
+            |b| {
+                b.iter_batched(
+                    || {
+                        let mut index =
+                            DigitBinIndex::with_precision_and_capacity(precision, MAX_CAPACITY);
+                        let mut rng = WyRand::from_os_rng();
+                        let minimum_weight = 10f64.powi(-(precision as i32));
+                        for id in 0..INITIAL_POP {
+                            index
+                                .add(id, rng.random_range(minimum_weight..(1.0 - minimum_weight)))
+                                .unwrap();
+                        }
+                        (index, INITIAL_POP, rng)
+                    },
+                    |(mut index, mut next_id, mut rng)| {
+                        black_box(index.select_pps_many_and_remove(CHURN_COUNT));
+                        let minimum_weight = 10f64.powi(-(precision as i32));
+                        for _ in 0..ACQUISITION_COUNT {
+                            index
+                                .add(
+                                    next_id,
+                                    rng.random_range(minimum_weight..(1.0 - minimum_weight)),
+                                )
+                                .unwrap();
+                            next_id += 1;
+                        }
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn benchmark_bernoulli_simulation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Independent Bernoulli Simulation");
+    group.throughput(Throughput::Elements(INITIAL_POP));
+
+    for precision in [3, 5] {
+        let scale = 10u64.pow(precision as u32);
+        let maximum_scaled_probability = scale / 20;
+
+        group.bench_function(
+            BenchmarkId::new(
+                format!("DigitBinIndex (precision {precision})"),
+                INITIAL_POP,
+            ),
+            |b| {
+                b.iter_batched(
+                    || {
+                        let mut index =
+                            DigitBinIndex::with_precision_and_capacity(precision, INITIAL_POP);
+                        let mut rng = WyRand::from_os_rng();
+                        for id in 0..INITIAL_POP {
+                            let scaled_probability =
+                                rng.random_range(1..=maximum_scaled_probability);
+                            index
+                                .add(id, scaled_probability as f64 / scale as f64)
+                                .unwrap();
+                        }
+                        (index, rng)
+                    },
+                    |(mut index, mut rng)| {
+                        black_box(index.select_bernoulli_many_and_remove_with_rng(&mut rng))
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+
+        group.bench_function(
+            BenchmarkId::new(format!("Item scan (precision {precision})"), INITIAL_POP),
+            |b| {
+                b.iter_batched(
+                    || {
+                        let mut rng = WyRand::from_os_rng();
+                        let items: Vec<_> = (0..INITIAL_POP)
+                            .map(|id| {
+                                let scaled_probability =
+                                    rng.random_range(1..=maximum_scaled_probability);
+                                (id, scaled_probability as f64 / scale as f64)
+                            })
+                            .collect();
+                        (items, rng)
+                    },
+                    |(mut items, mut rng)| {
+                        let mut selected = Vec::new();
+                        items.retain(|&(id, probability)| {
+                            if rng.random::<f64>() < probability {
+                                selected.push((id, probability));
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        black_box(selected)
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+    }
 
     group.finish();
 }
@@ -727,6 +851,8 @@ criterion_group!(
     benchmark_wallenius_simulation,
     benchmark_skewed_wallenius_simulation,
     benchmark_fisher_simulation,
+    benchmark_pps_simulation,
+    benchmark_bernoulli_simulation,
     insertion_benchmark,
     skewed_backend_benchmark
 );
