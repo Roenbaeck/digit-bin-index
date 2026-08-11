@@ -4,6 +4,7 @@
 import timeit
 import random
 import os
+import multiprocessing
 import psutil
 from digit_bin_index import DigitBinIndex
 
@@ -13,6 +14,31 @@ def get_memory_usage_mb():
     # rss (Resident Set Size) is a good measure of the actual physical memory a process is using
     return p.memory_info().rss / (1024 * 1024)
 
+
+def _measure_index_memory(num_items_to_test, connection):
+    """Measure one index in a fresh process without retaining an input list."""
+    baseline = get_memory_usage_mb()
+    index = DigitBinIndex.with_precision_and_capacity(3, num_items_to_test)
+    rng = random.Random(0)
+    for item_id in range(num_items_to_test):
+        index.add(id=item_id, weight=rng.random())
+    connection.send(get_memory_usage_mb() - baseline)
+    connection.close()
+
+
+def measure_index_memory(num_items_to_test):
+    parent, child = multiprocessing.Pipe(duplex=False)
+    process = multiprocessing.Process(
+        target=_measure_index_memory,
+        args=(num_items_to_test, child),
+    )
+    process.start()
+    memory_used = parent.recv()
+    process.join()
+    if process.exitcode != 0:
+        raise RuntimeError(f"memory worker exited with status {process.exitcode}")
+    return memory_used
+
 def run_benchmark(num_items_to_test):
     """
     Runs a heavily scaled benchmark and reports memory usage.
@@ -21,8 +47,6 @@ def run_benchmark(num_items_to_test):
     print("This may take some time...")
 
     # --- Memory and Time Benchmark for Populating the Index ---
-    mem_before_add = get_memory_usage_mb()
-
     setup_code_add = f"""
 from digit_bin_index import DigitBinIndex
 import random
@@ -34,15 +58,7 @@ index = DigitBinIndex.with_precision_and_capacity(3, {num_items_to_test})
     
     add_time = timeit.timeit(stmt=add_stmt, setup=setup_code_add, number=1)
     
-    # To measure memory, we need to actually create the index in this process
-    # The setup for timeit runs in a separate context.
-    data_for_mem_test = [(i, random.random()) for i in range(num_items_to_test)]
-    index = DigitBinIndex.with_precision_and_capacity(3, num_items_to_test)
-    for item_id, weight in data_for_mem_test:
-        index.add(id=item_id, weight=weight)
-    
-    mem_after_add = get_memory_usage_mb()
-    memory_used_by_index = mem_after_add - mem_before_add
+    memory_used_by_index = measure_index_memory(num_items_to_test)
     
     print(f"Time to add {num_items_to_test:,} items: {add_time:.6f} seconds")
     print(f"Estimated memory for index: {memory_used_by_index:.2f} MB")
@@ -65,8 +81,12 @@ for i in range({num_items_to_test}):
     select_time = timeit.timeit(stmt=select_stmt, setup=setup_code_select, number=number_of_runs_single)
     print(f"{number_of_runs_single:,} single selections: {select_time:.6f} seconds")
 
+    # --- Benchmark: sequential Wallenius batch ---
+    wallenius_batch_stmt = f"index.select_wallenius_many_and_remove({number_of_runs_single})"
+    wallenius_batch_time = timeit.timeit(stmt=wallenius_batch_stmt, setup=setup_code_select, number=1)
+    print(f"One Wallenius batch of {number_of_runs_single:,}: {wallenius_batch_time:.6f} seconds")
 
-    # --- Benchmark: select_many_and_remove ---
+    # --- Benchmark: simultaneous Fisher batches ---
     number_of_runs_many = 1_000
     select_many_stmt = "index.select_many_and_remove(100)"
     select_many_time = timeit.timeit(stmt=select_many_stmt, setup=setup_code_select, number=number_of_runs_many)

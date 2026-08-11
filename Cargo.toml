@@ -1,6 +1,6 @@
 [package]
 name = "digit-bin-index"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 authors = ["Lars Rönnbäck <lars.ronnback@anchormodeling.com>"]
 license = "MIT"
@@ -13,11 +13,12 @@ categories = ["data-structures", "algorithms", "science", "simulation"]
 [dependencies]
 wyrand = "0.3"
 rand = "0.9" 
+rand_distr = "0.5"
 roaring = "0.11"
 
 [dependencies.pyo3]
 version = "0.26.0"
-features = ["extension-module", "abi3-py38", "macros"] # Added abi3-py38 for broader Python compatibility
+features = ["abi3-py38", "macros"]
 optional = true
 
 [features]
@@ -38,4 +39,3 @@ codegen-units = 1  # Better optimizations, slower compiles
 [[bench]]
 name = "selection_benchmark"
 harness = false
-

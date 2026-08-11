@@ -4,128 +4,864 @@
 //!
 //! It is a specialized tool, purpose-built for scenarios with millions of
 //! items where probabilities are approximate and high performance is critical,
-//! particularly for simulations involving sequential sampling like Wallenius'
-//! noncentral hypergeometric distribution.
+//! including independent Bernoulli events, sequential Wallenius sampling,
+//! simultaneous Fisher sampling, and fixed-size PPS cohorts.
 
-use wyrand::WyRand;
-use rand::{distr::{Distribution, Uniform}, Rng, SeedableRng}; 
+use rand::{distr::Distribution, seq::SliceRandom, Rng, SeedableRng};
+use rand_distr::Binomial;
 use roaring::{RoaringBitmap, RoaringTreemap};
+use std::collections::HashSet;
+use std::fmt;
+use wyrand::WyRand;
 
 // The default precision to use if none is specified in the constructor.
 const DEFAULT_PRECISION: u8 = 3;
 const MAX_PRECISION: usize = 9;
+const FISHER_CONVOLUTION_BLOCK_SIZE: usize = 32;
+const FISHER_CONVOLUTION_MIN_BINS: usize = 4_096;
+const FISHER_CONVOLUTION_MAX_BIN_COUNT: u64 = 64;
+const FISHER_CONVOLUTION_TAIL_BLOCKS: usize = 16;
+
+/// Errors produced while constructing or mutating an index.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DigitBinError {
+    /// Precision must be in the inclusive range `1..=9`.
+    InvalidPrecision(u64),
+    /// Weights must be finite and strictly between zero and one.
+    InvalidWeight(f64),
+    /// The selected backend cannot represent this ID without truncation.
+    IdOutOfRange { id: u64, maximum: u64 },
+    /// IDs are unique across the complete index, including different weights.
+    DuplicateId(u64),
+    /// An aggregate count or scaled-weight sum would exceed `u64::MAX`.
+    CapacityOverflow,
+    /// Internal aggregate state was inconsistent during subtraction.
+    InvariantViolation,
+}
+
+impl fmt::Display for DigitBinError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPrecision(precision) => {
+                write!(
+                    formatter,
+                    "precision must be between 1 and {MAX_PRECISION}, got {precision}"
+                )
+            }
+            Self::InvalidWeight(weight) => {
+                write!(
+                    formatter,
+                    "weight must be finite and strictly between 0 and 1, got {weight}"
+                )
+            }
+            Self::IdOutOfRange { id, maximum } => {
+                write!(
+                    formatter,
+                    "ID {id} exceeds this backend's maximum ID {maximum}"
+                )
+            }
+            Self::DuplicateId(id) => write!(formatter, "ID {id} is already present in the index"),
+            Self::CapacityOverflow => {
+                formatter.write_str("index aggregate capacity would overflow u64")
+            }
+            Self::InvariantViolation => {
+                formatter.write_str("index aggregate invariants are inconsistent")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DigitBinError {}
+
+#[derive(Clone)]
+struct IndexRng(WyRand);
+
+impl std::fmt::Debug for IndexRng {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("IndexRng(..)")
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WeightBin {
+    count: u64,
+    scaled_weight: u64,
+}
+
+#[derive(Debug)]
+struct FisherConvolutionNode {
+    start: usize,
+    end: usize,
+    pmf: Vec<f64>,
+    left: Option<Box<FisherConvolutionNode>>,
+    right: Option<Box<FisherConvolutionNode>>,
+}
+
+impl FisherConvolutionNode {
+    fn build(start: usize, bins: &[WeightBin], probabilities: &[f64]) -> Option<Self> {
+        if bins.is_empty() || bins.len() != probabilities.len() {
+            return None;
+        }
+        if bins.len() == 1 {
+            return Some(Self {
+                start,
+                end: start + 1,
+                pmf: Self::binomial_pmf(bins[0].count, probabilities[0])?,
+                left: None,
+                right: None,
+            });
+        }
+
+        let midpoint = bins.len() / 2;
+        let left = Box::new(Self::build(
+            start,
+            &bins[..midpoint],
+            &probabilities[..midpoint],
+        )?);
+        let right = Box::new(Self::build(
+            start + midpoint,
+            &bins[midpoint..],
+            &probabilities[midpoint..],
+        )?);
+        let pmf = Self::convolve(&left.pmf, &right.pmf)?;
+        Some(Self {
+            start,
+            end: start + bins.len(),
+            pmf,
+            left: Some(left),
+            right: Some(right),
+        })
+    }
+
+    fn binomial_pmf(count: u64, probability: f64) -> Option<Vec<f64>> {
+        let count = usize::try_from(count).ok()?;
+        if !(0.0..=1.0).contains(&probability) || !probability.is_finite() {
+            return None;
+        }
+        if probability == 0.0 {
+            let mut pmf = vec![0.0; count + 1];
+            pmf[0] = 1.0;
+            return Some(pmf);
+        }
+        if probability == 1.0 {
+            let mut pmf = vec![0.0; count + 1];
+            pmf[count] = 1.0;
+            return Some(pmf);
+        }
+
+        let failure_probability = 1.0 - probability;
+        let mode = (((count + 1) as f64 * probability).floor() as usize).min(count);
+        let mut pmf = vec![0.0; count + 1];
+        pmf[mode] = 1.0;
+
+        for successes in (1..=mode).rev() {
+            pmf[successes - 1] = pmf[successes] * successes as f64 / (count - successes + 1) as f64
+                * failure_probability
+                / probability;
+        }
+        for successes in mode..count {
+            pmf[successes + 1] =
+                pmf[successes] * (count - successes) as f64 / (successes + 1) as f64 * probability
+                    / failure_probability;
+        }
+
+        Self::normalize(&mut pmf)?;
+        Some(pmf)
+    }
+
+    fn convolve(left: &[f64], right: &[f64]) -> Option<Vec<f64>> {
+        let mut result = vec![0.0; left.len() + right.len() - 1];
+        for (left_count, &left_probability) in left.iter().enumerate() {
+            if left_probability == 0.0 {
+                continue;
+            }
+            for (right_count, &right_probability) in right.iter().enumerate() {
+                result[left_count + right_count] += left_probability * right_probability;
+            }
+        }
+        Self::normalize(&mut result)?;
+        Some(result)
+    }
+
+    fn normalize(probabilities: &mut [f64]) -> Option<()> {
+        let total: f64 = probabilities.iter().sum();
+        if !total.is_finite() || total <= 0.0 {
+            return None;
+        }
+        for probability in probabilities {
+            *probability /= total;
+        }
+        Some(())
+    }
+
+    fn sample_conditioned(
+        &self,
+        total: usize,
+        counts: &mut [u64],
+        rng: &mut impl Rng,
+    ) -> Option<()> {
+        if total >= self.pmf.len() {
+            return None;
+        }
+        let (Some(left), Some(right)) = (&self.left, &self.right) else {
+            if self.end != self.start + 1 {
+                return None;
+            }
+            counts[self.start] = total as u64;
+            return Some(());
+        };
+
+        let left_max = left.pmf.len() - 1;
+        let right_max = right.pmf.len() - 1;
+        let minimum_left = total.saturating_sub(right_max);
+        let maximum_left = total.min(left_max);
+        let conditional_total: f64 = (minimum_left..=maximum_left)
+            .map(|left_count| left.pmf[left_count] * right.pmf[total - left_count])
+            .sum();
+        if !conditional_total.is_finite() || conditional_total <= 0.0 {
+            return None;
+        }
+
+        let mut threshold = rng.random::<f64>() * conditional_total;
+        let mut selected_left = maximum_left;
+        for left_count in minimum_left..=maximum_left {
+            threshold -= left.pmf[left_count] * right.pmf[total - left_count];
+            if threshold <= 0.0 {
+                selected_left = left_count;
+                break;
+            }
+        }
+        left.sample_conditioned(selected_left, counts, rng)?;
+        right.sample_conditioned(total - selected_left, counts, rng)
+    }
+}
+
+#[derive(Debug)]
+struct FisherConvolutionBlock {
+    root: FisherConvolutionNode,
+    cdf: Vec<f64>,
+}
+
+impl FisherConvolutionBlock {
+    fn build(start: usize, bins: &[WeightBin], probabilities: &[f64]) -> Option<Self> {
+        let root = FisherConvolutionNode::build(start, bins, probabilities)?;
+        let mut cumulative = 0.0;
+        let mut cdf = Vec::with_capacity(root.pmf.len());
+        for &probability in &root.pmf {
+            cumulative += probability;
+            cdf.push(cumulative.min(1.0));
+        }
+        if let Some(last) = cdf.last_mut() {
+            *last = 1.0;
+        }
+        Some(Self { root, cdf })
+    }
+
+    fn sample_total(&self, rng: &mut impl Rng) -> usize {
+        let threshold = rng.random::<f64>();
+        self.cdf
+            .partition_point(|&cumulative| cumulative < threshold)
+            .min(self.cdf.len() - 1)
+    }
+
+    fn sample_conditioned(
+        &self,
+        total: usize,
+        counts: &mut [u64],
+        rng: &mut impl Rng,
+    ) -> Option<()> {
+        self.root.sample_conditioned(total, counts, rng)
+    }
+
+    fn variance(&self) -> f64 {
+        let mean = self
+            .root
+            .pmf
+            .iter()
+            .enumerate()
+            .map(|(count, &probability)| count as f64 * probability)
+            .sum::<f64>();
+        let second_moment = self
+            .root
+            .pmf
+            .iter()
+            .enumerate()
+            .map(|(count, &probability)| (count * count) as f64 * probability)
+            .sum::<f64>();
+        (second_moment - mean * mean).max(0.0)
+    }
+}
+
+#[derive(Debug)]
+struct FisherBlockConvolutionNode {
+    block_index: Option<usize>,
+    pmf: Vec<f64>,
+    left: Option<Box<FisherBlockConvolutionNode>>,
+    right: Option<Box<FisherBlockConvolutionNode>>,
+}
+
+impl FisherBlockConvolutionNode {
+    fn build(blocks: &[(usize, &FisherConvolutionBlock)]) -> Option<Self> {
+        if blocks.is_empty() {
+            return None;
+        }
+        if blocks.len() == 1 {
+            let (block_index, block) = blocks[0];
+            return Some(Self {
+                block_index: Some(block_index),
+                pmf: block.root.pmf.clone(),
+                left: None,
+                right: None,
+            });
+        }
+
+        let midpoint = blocks.len() / 2;
+        let left = Box::new(Self::build(&blocks[..midpoint])?);
+        let right = Box::new(Self::build(&blocks[midpoint..])?);
+        let pmf = FisherConvolutionNode::convolve(&left.pmf, &right.pmf)?;
+        Some(Self {
+            block_index: None,
+            pmf,
+            left: Some(left),
+            right: Some(right),
+        })
+    }
+
+    fn sample_conditioned(
+        &self,
+        total: usize,
+        block_totals: &mut [usize],
+        rng: &mut impl Rng,
+    ) -> Option<()> {
+        if total >= self.pmf.len() {
+            return None;
+        }
+        let (Some(left), Some(right)) = (&self.left, &self.right) else {
+            block_totals[*self.block_index.as_ref()?] = total;
+            return Some(());
+        };
+
+        let left_max = left.pmf.len() - 1;
+        let right_max = right.pmf.len() - 1;
+        let minimum_left = total.saturating_sub(right_max);
+        let maximum_left = total.min(left_max);
+        let conditional_total: f64 = (minimum_left..=maximum_left)
+            .map(|left_count| left.pmf[left_count] * right.pmf[total - left_count])
+            .sum();
+        if !conditional_total.is_finite() || conditional_total <= 0.0 {
+            return None;
+        }
+
+        let mut threshold = rng.random::<f64>() * conditional_total;
+        let mut selected_left = maximum_left;
+        for left_count in minimum_left..=maximum_left {
+            threshold -= left.pmf[left_count] * right.pmf[total - left_count];
+            if threshold <= 0.0 {
+                selected_left = left_count;
+                break;
+            }
+        }
+        left.sample_conditioned(selected_left, block_totals, rng)?;
+        right.sample_conditioned(total - selected_left, block_totals, rng)
+    }
+
+    fn sample_block_totals(
+        blocks: &[FisherConvolutionBlock],
+        target: usize,
+        tail_block_count: usize,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<usize>> {
+        if blocks.is_empty() || tail_block_count == 0 {
+            return None;
+        }
+
+        let tail_block_count = tail_block_count.min(blocks.len());
+        // A wider tail PMF has a lower peak, which increases the acceptance
+        // probability below. Variance is therefore the useful budget metric.
+        let mut candidates: Vec<(usize, f64)> = blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (index, block.variance()))
+            .collect();
+        candidates.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+        let mut tail_indices: Vec<usize> = candidates
+            .into_iter()
+            .take(tail_block_count)
+            .map(|(index, _)| index)
+            .collect();
+        tail_indices.sort_unstable();
+
+        let mut is_tail = vec![false; blocks.len()];
+        for &index in &tail_indices {
+            is_tail[index] = true;
+        }
+        let tail_blocks: Vec<_> = tail_indices
+            .iter()
+            .map(|&index| (index, &blocks[index]))
+            .collect();
+        let tail = Self::build(&tail_blocks)?;
+        let maximum_tail_probability = tail.pmf.iter().copied().fold(0.0, f64::max);
+        if !maximum_tail_probability.is_finite() || maximum_tail_probability <= 0.0 {
+            return None;
+        }
+
+        let mut block_totals = vec![0usize; blocks.len()];
+        if tail_block_count == blocks.len() {
+            let target_probability = *tail.pmf.get(target)?;
+            if !target_probability.is_finite() || target_probability <= 0.0 {
+                return None;
+            }
+            tail.sample_conditioned(target, &mut block_totals, rng)?;
+            return Some(block_totals);
+        }
+
+        // For prefix total s, accepting with P(T = target - s) / max P(T)
+        // changes the proposal mass from P(S = s) to a value proportional to
+        // P(S = s) P(T = target - s), exactly the desired conditional law.
+        loop {
+            let mut prefix_total = 0usize;
+            for (index, block) in blocks.iter().enumerate() {
+                if !is_tail[index] {
+                    let block_total = block.sample_total(rng);
+                    block_totals[index] = block_total;
+                    prefix_total = prefix_total.checked_add(block_total)?;
+                }
+            }
+
+            let Some(residual) = target.checked_sub(prefix_total) else {
+                continue;
+            };
+            let Some(&residual_probability) = tail.pmf.get(residual) else {
+                continue;
+            };
+            if rng.random::<f64>() * maximum_tail_probability < residual_probability {
+                tail.sample_conditioned(residual, &mut block_totals, rng)?;
+                return Some(block_totals);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BatchExtractionSettings {
+    with_removal: bool,
+    scale: f64,
+    order_generation: u64,
+}
 
 /// Trait for types that can be used as leaf bins in a `DigitBinIndex`.
 ///
 /// Implement this trait for any container you want to use for storing IDs in the leaf nodes.
 /// Provided implementations: [`Vec<u32>`], [`RoaringBitmap`].
 pub trait DigitBin: Clone + Default {
-    fn insert(&mut self, id: u64);
+    /// Largest ID representable by this backend without truncation.
+    const MAX_ID: u64;
+
+    /// Inserts an ID and reports whether it was newly stored.
+    fn insert(&mut self, id: u64) -> bool;
     fn remove(&mut self, id: u64) -> bool;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
     fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u64>;
     fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u64>;
+    fn get_random_many(
+        &mut self,
+        rng: &mut impl rand::Rng,
+        count: usize,
+        with_removal: bool,
+    ) -> Option<Vec<u64>>;
+    /// Approximate heap storage owned by the bin, excluding its inline value.
+    fn estimated_heap_bytes(&self) -> usize;
 }
 
 impl DigitBin for Vec<u32> {
-    fn insert(&mut self, id: u64) { self.push(id as u32); }
+    const MAX_ID: u64 = u32::MAX as u64;
+
+    fn insert(&mut self, id: u64) -> bool {
+        let Ok(id) = u32::try_from(id) else {
+            return false;
+        };
+        self.push(id);
+        true
+    }
     fn remove(&mut self, id: u64) -> bool {
-        if let Some(pos) = self.iter().position(|&x| x == id as u32) {
+        let Ok(id) = u32::try_from(id) else {
+            return false;
+        };
+        if let Some(pos) = self.iter().position(|&x| x == id) {
             self.swap_remove(pos);
             true
         } else {
             false
         }
     }
-    fn len(&self) -> usize { self.len() }
-    fn is_empty(&self) -> bool { self.is_empty() }
+    fn len(&self) -> usize {
+        self.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
     fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u64> {
-        if self.is_empty() { None } else { Some(self[rng.random_range(0..self.len())] as u64) }
+        if self.is_empty() {
+            None
+        } else {
+            Some(self[rng.random_range(0..self.len())] as u64)
+        }
     }
     fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u64> {
-        if self.is_empty() { None } else {
+        if self.is_empty() {
+            None
+        } else {
             let pos = rng.random_range(0..self.len());
             Some(self.swap_remove(pos) as u64)
         }
     }
+    fn get_random_many(
+        &mut self,
+        rng: &mut impl rand::Rng,
+        count: usize,
+        with_removal: bool,
+    ) -> Option<Vec<u64>> {
+        if count > self.len() {
+            return None;
+        }
+        if with_removal && count == self.len() {
+            return Some(std::mem::take(self).into_iter().map(u64::from).collect());
+        }
+        if with_removal {
+            let mut selected = Vec::with_capacity(count);
+            for _ in 0..count {
+                let pos = rng.random_range(0..self.len());
+                selected.push(self.swap_remove(pos) as u64);
+            }
+            Some(selected)
+        } else {
+            Some(
+                rand::seq::index::sample(rng, self.len(), count)
+                    .into_iter()
+                    .map(|index| self[index] as u64)
+                    .collect(),
+            )
+        }
+    }
+
+    fn estimated_heap_bytes(&self) -> usize {
+        self.capacity() * std::mem::size_of::<u32>()
+    }
 }
 
 impl DigitBin for RoaringBitmap {
-    fn insert(&mut self, id: u64) { self.insert(id as u32); }
-    fn remove(&mut self, id: u64) -> bool { self.remove(id as u32) }
-    fn len(&self) -> usize { self.len() as usize }
-    fn is_empty(&self) -> bool { self.is_empty() }
+    const MAX_ID: u64 = u32::MAX as u64;
+
+    fn insert(&mut self, id: u64) -> bool {
+        u32::try_from(id).is_ok_and(|id| self.insert(id))
+    }
+    fn remove(&mut self, id: u64) -> bool {
+        u32::try_from(id).is_ok_and(|id| self.remove(id))
+    }
+    fn len(&self) -> usize {
+        self.len() as usize
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
     fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u64> {
-        if self.is_empty() { None } else {
+        if self.is_empty() {
+            None
+        } else {
             let idx = rng.random_range(0..self.len() as u32);
             self.select(idx).map(|v| v as u64)
         }
     }
     fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u64> {
-        if self.is_empty() { None } else {
+        if self.is_empty() {
+            None
+        } else {
             let idx = rng.random_range(0..self.len() as u32);
             let selected = self.select(idx);
             self.remove(selected.unwrap());
             selected.map(|v| v as u64)
         }
     }
+    fn get_random_many(
+        &mut self,
+        rng: &mut impl rand::Rng,
+        count: usize,
+        with_removal: bool,
+    ) -> Option<Vec<u64>> {
+        if count > self.len() as usize {
+            return None;
+        }
+        if with_removal && count == self.len() as usize {
+            let selected = self.iter().map(u64::from).collect();
+            self.clear();
+            return Some(selected);
+        }
+        if with_removal {
+            let selected: Option<Vec<u64>> =
+                rand::seq::index::sample(rng, self.len() as usize, count)
+                    .into_iter()
+                    .map(|index| self.select(index as u32).map(u64::from))
+                    .collect();
+            let selected = selected?;
+            for &id in &selected {
+                self.remove(id as u32);
+            }
+            Some(selected)
+        } else {
+            rand::seq::index::sample(rng, self.len() as usize, count)
+                .into_iter()
+                .map(|index| self.select(index as u32).map(u64::from))
+                .collect()
+        }
+    }
+
+    fn estimated_heap_bytes(&self) -> usize {
+        self.serialized_size()
+    }
 }
 
 impl DigitBin for RoaringTreemap {
-    fn insert(&mut self, id: u64) { self.insert(id); }
-    fn remove(&mut self, id: u64) -> bool { self.remove(id) }
-    fn len(&self) -> usize { self.len() as usize }
-    fn is_empty(&self) -> bool { self.is_empty() }
+    const MAX_ID: u64 = u64::MAX;
+
+    fn insert(&mut self, id: u64) -> bool {
+        self.insert(id)
+    }
+    fn remove(&mut self, id: u64) -> bool {
+        self.remove(id)
+    }
+    fn len(&self) -> usize {
+        self.len() as usize
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
     fn get_random(&self, rng: &mut impl rand::Rng) -> Option<u64> {
-        if self.is_empty() { None } else {
-            let idx = rng.random_range(0..self.len() as u64);
+        if self.is_empty() {
+            None
+        } else {
+            let idx = rng.random_range(0..self.len());
             self.select(idx)
         }
     }
     fn get_random_and_remove(&mut self, rng: &mut impl rand::Rng) -> Option<u64> {
-        if self.is_empty() { None } else {
+        if self.is_empty() {
+            None
+        } else {
             let idx = rng.random_range(0..self.len());
             let selected = self.select(idx);
             self.remove(selected.unwrap());
             selected
         }
     }
+    fn get_random_many(
+        &mut self,
+        rng: &mut impl rand::Rng,
+        count: usize,
+        with_removal: bool,
+    ) -> Option<Vec<u64>> {
+        if count > self.len() as usize {
+            return None;
+        }
+        if with_removal && count == self.len() as usize {
+            let selected = self.iter().collect();
+            self.clear();
+            return Some(selected);
+        }
+        if with_removal {
+            let selected: Option<Vec<u64>> =
+                rand::seq::index::sample(rng, self.len() as usize, count)
+                    .into_iter()
+                    .map(|index| self.select(index as u64))
+                    .collect();
+            let selected = selected?;
+            for &id in &selected {
+                self.remove(id);
+            }
+            Some(selected)
+        } else {
+            rand::seq::index::sample(rng, self.len() as usize, count)
+                .into_iter()
+                .map(|index| self.select(index as u64))
+                .collect()
+        }
+    }
+
+    fn estimated_heap_bytes(&self) -> usize {
+        self.serialized_size()
+    }
 }
 
-// Helper to create an array of Option<T>
-fn new_children_array<B: DigitBin>() -> Box<[Option<Node<B>>; 10]> {
-    // This is a standard way to initialize an array of non-Copy types.
-    let data: [Option<Node<B>>; 10] = Default::default();
-    Box::new(data)
+/// Direct digit lookup plus the optimal descending-mass order for selection.
+#[derive(Debug, Clone)]
+struct DigitIndex<B: DigitBin> {
+    children: Box<[Option<Node<B>>; 10]>,
+    order: [u8; 10],
+    active_len: u8,
+    active_mask: u16,
+    order_generation: u64,
+}
+
+impl<B: DigitBin> DigitIndex<B> {
+    fn new() -> Self {
+        Self {
+            children: Box::default(),
+            order: [0; 10],
+            active_len: 0,
+            active_mask: 0,
+            order_generation: 0,
+        }
+    }
+
+    fn get_or_insert_with(
+        &mut self,
+        digit: usize,
+        create: impl FnOnce() -> Node<B>,
+    ) -> &mut Node<B> {
+        let digit_mask = 1u16 << digit;
+        if self.children[digit].is_none() {
+            self.order[self.active_len as usize] = digit as u8;
+            self.active_len += 1;
+            self.active_mask |= digit_mask;
+            self.children[digit] = Some(create());
+        } else if self.active_mask & digit_mask == 0 {
+            self.order[self.active_len as usize] = digit as u8;
+            self.active_len += 1;
+            self.active_mask |= digit_mask;
+        }
+        self.children[digit].as_mut().unwrap()
+    }
+
+    fn get_mut(&mut self, digit: usize) -> Option<&mut Node<B>> {
+        self.children[digit].as_mut()
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &Option<Node<B>>> {
+        self.children.iter()
+    }
+
+    fn child_decreased_at(&mut self, mut position: usize) {
+        let digit = self.order[position];
+        let mass = self.children[digit as usize]
+            .as_ref()
+            .map_or(0, |child| child.accumulated_value);
+        if mass == 0 {
+            let active_len = self.active_len as usize;
+            self.order.copy_within(position + 1..active_len, position);
+            self.active_len -= 1;
+            self.active_mask &= !(1u16 << digit);
+            self.children[digit as usize] = None;
+            return;
+        }
+
+        while position + 1 < self.active_len as usize
+            && self.precedes(self.order[position + 1], digit)
+        {
+            self.order.swap(position, position + 1);
+            position += 1;
+        }
+    }
+
+    fn precedes(&self, left: u8, right: u8) -> bool {
+        let left_mass = self.children[left as usize]
+            .as_ref()
+            .map_or(0, |child| child.accumulated_value);
+        let right_mass = self.children[right as usize]
+            .as_ref()
+            .map_or(0, |child| child.accumulated_value);
+        left_mass > right_mass || (left_mass == right_mass && left > right)
+    }
+
+    #[cfg(test)]
+    fn ordered_digits(&self) -> &[u8] {
+        &self.order[..self.active_len as usize]
+    }
+
+    fn ensure_order(&mut self, current_generation: u64) {
+        if self.order_generation == current_generation {
+            return;
+        }
+
+        let children = &self.children;
+        self.order[..self.active_len as usize].sort_unstable_by(|&left, &right| {
+            let left_mass = children[left as usize]
+                .as_ref()
+                .map_or(0, |child| child.accumulated_value);
+            let right_mass = children[right as usize]
+                .as_ref()
+                .map_or(0, |child| child.accumulated_value);
+            right_mass.cmp(&left_mass).then_with(|| right.cmp(&left))
+        });
+        self.order_generation = current_generation;
+    }
+
+    fn rebuild_order(&mut self, current_generation: u64) {
+        self.active_len = 0;
+        self.active_mask = 0;
+        for digit in 0..10 {
+            if self.children[digit]
+                .as_ref()
+                .is_some_and(|child| child.accumulated_value > 0)
+            {
+                self.order[self.active_len as usize] = digit as u8;
+                self.active_len += 1;
+                self.active_mask |= 1u16 << digit;
+            }
+        }
+        self.order_generation = current_generation.wrapping_sub(1);
+        self.ensure_order(current_generation);
+    }
+
+    fn remove_digit(&mut self, digit: usize) {
+        self.children[digit] = None;
+        let digit_mask = 1u16 << digit;
+        if self.active_mask & digit_mask == 0 {
+            return;
+        }
+        if let Some(position) = self.order[..self.active_len as usize]
+            .iter()
+            .position(|&active_digit| usize::from(active_digit) == digit)
+        {
+            let active_len = self.active_len as usize;
+            self.order.copy_within(position + 1..active_len, position);
+            self.active_len -= 1;
+        }
+        self.active_mask &= !digit_mask;
+    }
 }
 
 /// The content of a node, which is either more nodes or a leaf with individuals.
 #[derive(Debug, Clone)]
-pub enum NodeContent<B: DigitBin> {
+enum NodeContent<B: DigitBin> {
     /// An internal node that contains children for the next digit (0-9).
-    DigitIndex(Box<[Option<Node<B>>; 10]>),
+    DigitIndex(DigitIndex<B>),
     /// A leaf node that contains a bin of IDs for individuals in this bin.
     Bin(B),
 }
 
 /// A node within the DigitBinIndex tree.
 #[derive(Debug, Clone)]
-pub struct Node<B: DigitBin> {
-    /// The content of this node, either more nodes or a list of individual IDs.
-    pub content: NodeContent<B>,
-    /// The total sum of scaled values stored under this node.
-    pub accumulated_value: u64,
-    /// The total count of individuals stored under this node.
-    pub content_count: u64,
+struct Node<B: DigitBin> {
+    content: NodeContent<B>,
+    accumulated_value: u64,
+    content_count: u64,
 }
 
 impl<B: DigitBin> Node<B> {
     /// Creates a new, empty internal node.
     fn new_internal() -> Self {
         Self {
-            content: NodeContent::DigitIndex(new_children_array()), 
+            content: NodeContent::DigitIndex(DigitIndex::new()),
             accumulated_value: 0u64,
+            content_count: 0,
+        }
+    }
+
+    /// Creates a new, empty leaf node.
+    fn new_bin() -> Self {
+        Self {
+            content: NodeContent::Bin(B::default()),
+            accumulated_value: 0,
             content_count: 0,
         }
     }
@@ -134,13 +870,12 @@ impl<B: DigitBin> Node<B> {
 /// A data structure that organizes weighted items into bins based on their
 /// decimal digits to enable fast weighted random selection and updates.
 ///
-/// This structure is a specialized radix tree optimized for sequential sampling
-/// (like in Wallenius' distribution). It makes a deliberate engineering trade-off:
-/// it sacrifices a small, controllable amount of precision by binning items,
-/// but in return, it achieves O(P) performance for its core operations, where P
-/// is the configured precision. This is significantly faster than the O(log N)
-/// performance of general-purpose structures like a Fenwick Tree for its
-/// ideal use case.
+/// This structure is a specialized radix tree optimized for several weighted
+/// sampling designs. It makes a deliberate engineering trade-off: it sacrifices
+/// a small, controllable amount of precision by binning items, but in return,
+/// tree traversal is O(P), where P is the configured precision. Explicit removal
+/// from a `Vec` leaf is linear in that leaf's size, while Bernoulli, Fisher, and
+/// PPS batching also depend on the number of occupied weight bins.
 ///
 /// # Examples
 ///
@@ -155,9 +890,17 @@ pub enum DigitBinIndex {
     Large(DigitBinIndexGeneric<RoaringTreemap>),
 }
 
+impl Default for DigitBinIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DigitBinIndex {
     /// Creates a new DigitBinIndex with the given precision and expected capacity.
-    /// Uses Vec<u32> for small bins, RoaringBitmap for large bins.
+    /// Chooses a backend from expected average bin occupancy. Highly skewed
+    /// workloads should prefer [`small`](Self::small), [`medium`](Self::medium),
+    /// or [`large`](Self::large) explicitly after benchmarking representative data.
     ///
     /// # Arguments
     ///
@@ -181,24 +924,38 @@ impl DigitBinIndex {
     /// // Uses Vec<u32> because capacity is small
     /// ```
     pub fn with_precision_and_capacity(precision: u8, capacity: u64) -> Self {
+        Self::try_with_precision_and_capacity(precision, capacity)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Validated variant of [`with_precision_and_capacity`](Self::with_precision_and_capacity).
+    pub fn try_with_precision_and_capacity(
+        precision: u8,
+        capacity: u64,
+    ) -> Result<Self, DigitBinError> {
+        if precision == 0 || usize::from(precision) > MAX_PRECISION {
+            return Err(DigitBinError::InvalidPrecision(u64::from(precision)));
+        }
         let max_bins = 10u64.pow(precision as u32);
         if capacity / max_bins > 1_000_000_000 {
-            // Heuristic: Use RoaringTreemap if average bin size (capacity / 10^precision) exceeds threshold
-            DigitBinIndex::Large(DigitBinIndexGeneric::<RoaringTreemap>::with_precision(precision))
-        }
-        else if capacity / max_bins > 1_000 {
-            // Heuristic: Use RoaringBitmap if average bin size (capacity / 10^precision) exceeds threshold
-            DigitBinIndex::Medium(DigitBinIndexGeneric::<RoaringBitmap>::with_precision(precision))
+            Ok(DigitBinIndex::Large(
+                DigitBinIndexGeneric::<RoaringTreemap>::try_with_precision(precision)?,
+            ))
+        } else if capacity / max_bins > 1_000 {
+            Ok(DigitBinIndex::Medium(
+                DigitBinIndexGeneric::<RoaringBitmap>::try_with_precision(precision)?,
+            ))
         } else {
-            // Heuristic: Use Vec<u32> for small average bin sizes
-            DigitBinIndex::Small(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
+            Ok(DigitBinIndex::Small(
+                DigitBinIndexGeneric::<Vec<u32>>::try_with_precision(precision)?,
+            ))
         }
     }
 
     /// Creates a new DigitBinIndex with Vec<u32> bins and the specified precision.
     ///
     /// Optimized for small to medium-sized problems (average <= 1,000 items per bin).
-    /// Provides the fastest O(1) select_and_remove performance but truncates u64 IDs to u32.
+    /// IDs above `u32::MAX` are rejected by mutation methods.
     ///
     /// # Arguments
     ///
@@ -221,13 +978,21 @@ impl DigitBinIndex {
     /// assert_eq!(index.precision(), 3);
     /// ```
     pub fn small(precision: u8) -> Self {
-        DigitBinIndex::Small(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
+        Self::try_small(precision).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Validated variant of [`small`](Self::small).
+    pub fn try_small(precision: u8) -> Result<Self, DigitBinError> {
+        Ok(DigitBinIndex::Small(
+            DigitBinIndexGeneric::<Vec<u32>>::try_with_precision(precision)?,
+        ))
     }
 
     /// Creates a new DigitBinIndex with RoaringBitmap bins and the specified precision.
     ///
     /// Optimized for large-scale problems (average > 1,000 items per bin) where IDs fit within u32.
-    /// Provides excellent memory compression and fast set operations but truncates u64 IDs to u32.
+    /// Provides memory compression and fast set operations. IDs above
+    /// `u32::MAX` are rejected by mutation methods.
     ///
     /// # Arguments
     ///
@@ -250,7 +1015,14 @@ impl DigitBinIndex {
     /// assert_eq!(index.precision(), 3);
     /// ```
     pub fn medium(precision: u8) -> Self {
-        DigitBinIndex::Medium(DigitBinIndexGeneric::<RoaringBitmap>::with_precision(precision))
+        Self::try_medium(precision).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Validated variant of [`medium`](Self::medium).
+    pub fn try_medium(precision: u8) -> Result<Self, DigitBinError> {
+        Ok(DigitBinIndex::Medium(
+            DigitBinIndexGeneric::<RoaringBitmap>::try_with_precision(precision)?,
+        ))
     }
 
     /// Creates a new DigitBinIndex with RoaringTreemap bins and the specified precision.
@@ -279,7 +1051,14 @@ impl DigitBinIndex {
     /// assert_eq!(index.precision(), 3);
     /// ```
     pub fn large(precision: u8) -> Self {
-        DigitBinIndex::Large(DigitBinIndexGeneric::<RoaringTreemap>::with_precision(precision))
+        Self::try_large(precision).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Validated variant of [`large`](Self::large).
+    pub fn try_large(precision: u8) -> Result<Self, DigitBinError> {
+        Ok(DigitBinIndex::Large(
+            DigitBinIndexGeneric::<RoaringTreemap>::try_with_precision(precision)?,
+        ))
     }
 
     /// Creates a new `DigitBinIndex` instance with the default precision.
@@ -331,22 +1110,29 @@ impl DigitBinIndex {
     /// assert_eq!(index.precision(), 4);
     /// ```
     pub fn with_precision(precision: u8) -> Self {
-        DigitBinIndex::Small(DigitBinIndexGeneric::<Vec<u32>>::with_precision(precision))
+        Self::try_with_precision(precision).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Validated variant of [`with_precision`](Self::with_precision).
+    pub fn try_with_precision(precision: u8) -> Result<Self, DigitBinError> {
+        Self::try_small(precision)
     }
 
     /// Adds an item with the given ID and weight to the index.
     ///
-    /// The weight is rescaled to the index's precision and binned accordingly.
-    /// If the weight is non-positive or becomes zero after scaling, the item is not added.
+    /// The weight must be finite and in `(0, 1)`. It is rounded to the nearest
+    /// representable decimal bin, with positive boundary values clamped to the
+    /// smallest or largest bin. IDs must be unique across the complete index.
     ///
     /// # Arguments
     ///
-    /// * `individual_id` - The unique ID of the item to add (u32).
-    /// * `weight` - The positive weight (probability) of the item.
+    /// * `individual_id` - The unique ID of the item to add.
+    /// * `weight` - A finite weight strictly between zero and one.
     ///
     /// # Returns
     ///
-    /// `true` if the item was successfully added, `false` otherwise (e.g., invalid weight).
+    /// An error for invalid weights, duplicate IDs, backend ID overflow, or
+    /// aggregate overflow.
     ///
     /// # Examples
     ///
@@ -354,10 +1140,10 @@ impl DigitBinIndex {
     /// use digit_bin_index::DigitBinIndex;
     ///
     /// let mut index = DigitBinIndex::new();
-    /// let added = index.add(1, 0.5);
+    /// index.add(1, 0.5).unwrap();
     /// assert_eq!(index.count(), 1);
     /// ```    
-    pub fn add(&mut self, id: u64, weight: f64) {
+    pub fn add(&mut self, id: u64, weight: f64) -> Result<(), DigitBinError> {
         match self {
             DigitBinIndex::Small(index) => index.add(id, weight),
             DigitBinIndex::Medium(index) => index.add(id, weight),
@@ -365,16 +1151,11 @@ impl DigitBinIndex {
         }
     }
 
-    /// Adds multiple items to the index in a highly optimized batch operation.
+    /// Adds multiple items after validating the complete input.
     ///
-    /// This method is significantly faster than calling `add` in a loop for large
-    /// collections of items. It works by pre-processing the input, grouping items
-    /// by their shared weight, and then propagating each group through the tree in
-    /// a single pass. This minimizes cache misses and reduces function call overhead.
-    ///
-    /// Weights are rescaled to the index's precision and binned accordingly.
-    /// Items with non-positive weights or weights that become zero after scaling
-    /// will be ignored.
+    /// Validation is atomic: no item is inserted if any weight, ID, duplicate, or
+    /// aggregate-capacity check fails. Tree insertion remains one radix traversal
+    /// per item; this method does not currently group equal weight paths.
     ///
     /// # Arguments
     ///
@@ -387,13 +1168,13 @@ impl DigitBinIndex {
     ///
     /// let mut index = DigitBinIndex::new();
     /// let items_to_add = vec![(1, 0.1), (2, 0.2), (3, 0.1)];
-    /// index.add_many(&items_to_add);
+    /// index.add_many(&items_to_add).unwrap();
     ///
     /// assert_eq!(index.count(), 3);
     /// // The total weight should be 0.1 + 0.2 + 0.1 = 0.4
     /// assert!((index.total_weight() - 0.4).abs() < f64::EPSILON);
     /// ```
-    pub fn add_many(&mut self, items: &[(u64, f64)]) {
+    pub fn add_many(&mut self, items: &[(u64, f64)]) -> Result<(), DigitBinError> {
         match self {
             DigitBinIndex::Small(index) => index.add_many(items),
             DigitBinIndex::Medium(index) => index.add_many(items),
@@ -417,11 +1198,11 @@ impl DigitBinIndex {
     /// use digit_bin_index::DigitBinIndex;
     ///
     /// let mut index = DigitBinIndex::new();
-    /// index.add(1, 0.5);
-    /// index.remove(1, 0.5);
+    /// index.add(1, 0.5).unwrap();
+    /// index.remove(1, 0.5).unwrap();
     /// assert_eq!(index.count(), 0);
     /// ```
-    pub fn remove(&mut self, id: u64, weight: f64) -> bool {
+    pub fn remove(&mut self, id: u64, weight: f64) -> Result<bool, DigitBinError> {
         match self {
             DigitBinIndex::Small(index) => index.remove(id, weight),
             DigitBinIndex::Medium(index) => index.remove(id, weight),
@@ -429,14 +1210,13 @@ impl DigitBinIndex {
         }
     }
 
-    /// Removes multiple items from the index in a highly optimized batch operation.
-    ///
-    /// This method is significantly faster than calling `remove` in a loop. It
-    /// groups the items to be removed by their weight path and traverses the tree
-    /// only once per group, performing aggregated updates on the way up.
+    /// Removes multiple items by applying the requested removals in order.
     ///
     /// The `(id, weight)` pairs must match items that are currently in the index.
-    /// If a given pair is not found, it is silently ignored.
+    /// The operation is partially mutating: valid matches before a missing pair
+    /// remain removed. It returns `Ok(true)` only when every pair was removed,
+    /// and `Ok(false)` otherwise. Invalid IDs or weights are validated before any
+    /// removals begin.
     ///
     /// # Arguments
     ///
@@ -449,23 +1229,23 @@ impl DigitBinIndex {
     ///
     /// let mut index = DigitBinIndex::new();
     /// let items_to_add = vec![(1, 0.1), (2, 0.2), (3, 0.1), (4, 0.3)];
-    /// index.add_many(&items_to_add);
+    /// index.add_many(&items_to_add).unwrap();
     /// assert_eq!(index.count(), 4);
     ///
     /// let items_to_remove = vec![(2, 0.2), (3, 0.1)];
-    /// index.remove_many(&items_to_remove);
+    /// index.remove_many(&items_to_remove).unwrap();
     ///
     /// assert_eq!(index.count(), 2); // Items 1 and 4 should remain
     /// // The total weight should be 0.1 + 0.3 = 0.4
     /// assert!((index.total_weight() - 0.4).abs() < f64::EPSILON);
     /// ```
-    pub fn remove_many(&mut self, items: &[(u64, f64)]) -> bool {
+    pub fn remove_many(&mut self, items: &[(u64, f64)]) -> Result<bool, DigitBinError> {
         match self {
             DigitBinIndex::Small(index) => index.remove_many(items),
             DigitBinIndex::Medium(index) => index.remove_many(items),
             DigitBinIndex::Large(index) => index.remove_many(items),
         }
-    }    
+    }
 
     /// Selects a single item randomly based on weights without removal.
     ///
@@ -481,7 +1261,7 @@ impl DigitBinIndex {
     /// use digit_bin_index::DigitBinIndex;
     ///
     /// let mut index = DigitBinIndex::new();
-    /// index.add(1, 0.5);
+    /// index.add(1, 0.5).unwrap();
     /// if let Some((id, weight)) = index.select() {
     ///     assert_eq!(id, 1);
     ///     assert_eq!(weight, 0.5);
@@ -492,6 +1272,15 @@ impl DigitBinIndex {
             DigitBinIndex::Small(index) => index.select(),
             DigitBinIndex::Medium(index) => index.select(),
             DigitBinIndex::Large(index) => index.select(),
+        }
+    }
+
+    /// Selects a single item using the caller-provided random number generator.
+    pub fn select_with_rng(&mut self, rng: &mut impl Rng) -> Option<(u64, f64)> {
+        match self {
+            DigitBinIndex::Small(index) => index.select_with_rng(rng),
+            DigitBinIndex::Medium(index) => index.select_with_rng(rng),
+            DigitBinIndex::Large(index) => index.select_with_rng(rng),
         }
     }
 
@@ -509,7 +1298,7 @@ impl DigitBinIndex {
     /// use digit_bin_index::DigitBinIndex;
     ///
     /// let mut index = DigitBinIndex::new();
-    /// index.add(1, 0.5);
+    /// index.add(1, 0.5).unwrap();
     /// if let Some((id, _)) = index.select_and_remove() {
     ///     assert_eq!(id, 1);
     /// }
@@ -523,10 +1312,210 @@ impl DigitBinIndex {
         }
     }
 
+    /// Selects and removes a single item using the caller-provided random
+    /// number generator.
+    pub fn select_and_remove_with_rng(&mut self, rng: &mut impl Rng) -> Option<(u64, f64)> {
+        match self {
+            DigitBinIndex::Small(index) => index.select_and_remove_with_rng(rng),
+            DigitBinIndex::Medium(index) => index.select_and_remove_with_rng(rng),
+            DigitBinIndex::Large(index) => index.select_and_remove_with_rng(rng),
+        }
+    }
+
+    /// Performs repeated weighted draws with removal, producing Wallenius'
+    /// noncentral hypergeometric law for the index's quantized weights.
+    pub fn select_wallenius_many_and_remove(
+        &mut self,
+        num_to_draw: u64,
+    ) -> Option<Vec<(u64, f64)>> {
+        match self {
+            DigitBinIndex::Small(index) => index.select_wallenius_many_and_remove(num_to_draw),
+            DigitBinIndex::Medium(index) => index.select_wallenius_many_and_remove(num_to_draw),
+            DigitBinIndex::Large(index) => index.select_wallenius_many_and_remove(num_to_draw),
+        }
+    }
+
+    /// Performs repeated weighted draws with removal using the caller-provided
+    /// random number generator.
+    pub fn select_wallenius_many_and_remove_with_rng(
+        &mut self,
+        num_to_draw: u64,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        match self {
+            DigitBinIndex::Small(index) => {
+                index.select_wallenius_many_and_remove_with_rng(num_to_draw, rng)
+            }
+            DigitBinIndex::Medium(index) => {
+                index.select_wallenius_many_and_remove_with_rng(num_to_draw, rng)
+            }
+            DigitBinIndex::Large(index) => {
+                index.select_wallenius_many_and_remove_with_rng(num_to_draw, rng)
+            }
+        }
+    }
+
+    /// Selects every item independently with its quantized weight as its
+    /// Bernoulli probability.
+    ///
+    /// Unlike Fisher, Wallenius, and PPS selection, the returned sample size is
+    /// random. Items in an equal-probability bin are sampled by first drawing
+    /// the bin's selected count from `Binomial(bin_size, probability)`, then
+    /// choosing that many IDs uniformly without replacement. This is exactly
+    /// equivalent to an independent Bernoulli trial for every item.
+    ///
+    /// A successful draw may be empty and is returned as `Some(Vec::new())`.
+    /// The index is not modified.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    ///
+    /// let mut index = DigitBinIndex::with_precision(2);
+    /// index.add(1, 0.10).unwrap();
+    /// index.add(2, 0.25).unwrap();
+    /// let events = index.select_bernoulli_many().unwrap();
+    /// assert!(events.len() <= 2);
+    /// assert_eq!(index.count(), 2);
+    /// ```
+    pub fn select_bernoulli_many(&mut self) -> Option<Vec<(u64, f64)>> {
+        match self {
+            DigitBinIndex::Small(index) => index.select_bernoulli_many(),
+            DigitBinIndex::Medium(index) => index.select_bernoulli_many(),
+            DigitBinIndex::Large(index) => index.select_bernoulli_many(),
+        }
+    }
+
+    /// Performs independent Bernoulli selection using the caller-provided
+    /// random number generator.
+    pub fn select_bernoulli_many_with_rng(
+        &mut self,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        match self {
+            DigitBinIndex::Small(index) => index.select_bernoulli_many_with_rng(rng),
+            DigitBinIndex::Medium(index) => index.select_bernoulli_many_with_rng(rng),
+            DigitBinIndex::Large(index) => index.select_bernoulli_many_with_rng(rng),
+        }
+    }
+
+    /// Independently selects items using their quantized weights as Bernoulli
+    /// probabilities and removes every selected item.
+    ///
+    /// This has the same independent inclusion probabilities as
+    /// [`select_bernoulli_many`](Self::select_bernoulli_many), then removes the
+    /// selected IDs. An empty sample is a successful outcome and leaves the
+    /// index unchanged.
+    pub fn select_bernoulli_many_and_remove(&mut self) -> Option<Vec<(u64, f64)>> {
+        match self {
+            DigitBinIndex::Small(index) => index.select_bernoulli_many_and_remove(),
+            DigitBinIndex::Medium(index) => index.select_bernoulli_many_and_remove(),
+            DigitBinIndex::Large(index) => index.select_bernoulli_many_and_remove(),
+        }
+    }
+
+    /// Independently selects and removes items using the caller-provided random
+    /// number generator.
+    pub fn select_bernoulli_many_and_remove_with_rng(
+        &mut self,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        match self {
+            DigitBinIndex::Small(index) => index.select_bernoulli_many_and_remove_with_rng(rng),
+            DigitBinIndex::Medium(index) => index.select_bernoulli_many_and_remove_with_rng(rng),
+            DigitBinIndex::Large(index) => index.select_bernoulli_many_and_remove_with_rng(rng),
+        }
+    }
+
+    /// Selects a fixed-size probability-proportional-to-size (PPS) sample.
+    ///
+    /// PPS interprets each quantized weight as a size measure that controls the
+    /// item's marginal inclusion probability, rather than as Fisher or
+    /// Wallenius odds. When no item is certain, item `i` is included with
+    /// probability `num_to_draw * weight_i / total_weight`. If that value
+    /// reaches one, the item is included with certainty and the remaining
+    /// probabilities are recomputed over the remaining items.
+    ///
+    /// The implementation uses randomized systematic rounding over occupied
+    /// equal-weight bins, followed by uniform sampling without replacement
+    /// inside each bin. It always returns unique IDs and does not mutate the
+    /// index. Returns `None` if `num_to_draw` exceeds the item count.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use digit_bin_index::DigitBinIndex;
+    ///
+    /// let mut index = DigitBinIndex::new();
+    /// index.add(1, 0.1).unwrap();
+    /// index.add(2, 0.2).unwrap();
+    /// index.add(3, 0.7).unwrap();
+    /// let selected = index.select_pps_many(2).unwrap();
+    /// assert_eq!(selected.len(), 2);
+    /// assert_eq!(index.count(), 3);
+    /// ```
+    pub fn select_pps_many(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
+        match self {
+            DigitBinIndex::Small(index) => index.select_pps_many(num_to_draw),
+            DigitBinIndex::Medium(index) => index.select_pps_many(num_to_draw),
+            DigitBinIndex::Large(index) => index.select_pps_many(num_to_draw),
+        }
+    }
+
+    /// Selects a PPS sample using the caller-provided random number generator.
+    pub fn select_pps_many_with_rng(
+        &mut self,
+        num_to_draw: u64,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        match self {
+            DigitBinIndex::Small(index) => index.select_pps_many_with_rng(num_to_draw, rng),
+            DigitBinIndex::Medium(index) => index.select_pps_many_with_rng(num_to_draw, rng),
+            DigitBinIndex::Large(index) => index.select_pps_many_with_rng(num_to_draw, rng),
+        }
+    }
+
+    /// Selects and removes a fixed-size PPS sample.
+    ///
+    /// This has the same inclusion probabilities and joint design as
+    /// [`select_pps_many`](Self::select_pps_many), then removes every selected
+    /// ID from the index.
+    pub fn select_pps_many_and_remove(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
+        match self {
+            DigitBinIndex::Small(index) => index.select_pps_many_and_remove(num_to_draw),
+            DigitBinIndex::Medium(index) => index.select_pps_many_and_remove(num_to_draw),
+            DigitBinIndex::Large(index) => index.select_pps_many_and_remove(num_to_draw),
+        }
+    }
+
+    /// Selects and removes a PPS sample using the caller-provided random number
+    /// generator.
+    pub fn select_pps_many_and_remove_with_rng(
+        &mut self,
+        num_to_draw: u64,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        match self {
+            DigitBinIndex::Small(index) => {
+                index.select_pps_many_and_remove_with_rng(num_to_draw, rng)
+            }
+            DigitBinIndex::Medium(index) => {
+                index.select_pps_many_and_remove_with_rng(num_to_draw, rng)
+            }
+            DigitBinIndex::Large(index) => {
+                index.select_pps_many_and_remove_with_rng(num_to_draw, rng)
+            }
+        }
+    }
+
     /// Selects multiple unique items randomly based on weights without removal.
     ///
-    /// Uses rejection sampling to ensure uniqueness. Returns `None` if `num_to_draw`
-    /// exceeds the number of items in the index.
+    /// Samples the exact multivariate Fisher noncentral hypergeometric law for
+    /// the index's quantized weights. Small draws use weighted proposals
+    /// conditioned on unique IDs; larger draws use exponentially tilted
+    /// binomial counts conditioned on the requested total. Returns `None` if
+    /// `num_to_draw` exceeds the number of items in the index.
     ///
     /// # Arguments
     ///
@@ -542,8 +1531,8 @@ impl DigitBinIndex {
     /// use digit_bin_index::DigitBinIndex;
     ///
     /// let mut index = DigitBinIndex::new();
-    /// index.add(1, 0.3);
-    /// index.add(2, 0.7);
+    /// index.add(1, 0.3).unwrap();
+    /// index.add(2, 0.7).unwrap();
     /// if let Some(selected) = index.select_many(2) {
     ///     assert_eq!(selected.len(), 2);
     /// }
@@ -558,7 +1547,9 @@ impl DigitBinIndex {
 
     /// Selects multiple unique items randomly and removes them from the index.
     ///
-    /// Selects and removes in batch. Returns `None` if `num_to_draw` exceeds item count.
+    /// Samples the exact multivariate Fisher noncentral hypergeometric law for
+    /// the index's quantized weights and removes the selected IDs in batches.
+    /// Returns `None` if `num_to_draw` exceeds item count.
     ///
     /// # Arguments
     ///
@@ -574,8 +1565,8 @@ impl DigitBinIndex {
     /// use digit_bin_index::DigitBinIndex;
     ///
     /// let mut index = DigitBinIndex::new();
-    /// index.add(1, 0.3);
-    /// index.add(2, 0.7);
+    /// index.add(1, 0.3).unwrap();
+    /// index.add(2, 0.7).unwrap();
     /// if let Some(selected) = index.select_many_and_remove(2) {
     ///     assert_eq!(selected.len(), 2);
     /// }
@@ -593,7 +1584,7 @@ impl DigitBinIndex {
     ///
     /// # Returns
     ///
-    /// The count of items as a `u32`.
+    /// The count of items as a `u64`.
     ///
     /// # Examples
     ///
@@ -625,7 +1616,7 @@ impl DigitBinIndex {
     /// use digit_bin_index::DigitBinIndex;
     ///
     /// let mut index = DigitBinIndex::new();
-    /// index.add(1, 0.5);
+    /// index.add(1, 0.5).unwrap();
     /// assert_eq!(index.total_weight(), 0.5);
     /// ```
     pub fn total_weight(&self) -> f64 {
@@ -645,15 +1636,15 @@ impl DigitBinIndex {
             DigitBinIndex::Small(idx) => {
                 println!("- Index Type: Small (Vec<u32>)");
                 idx.print_stats_generic();
-            },
+            }
             DigitBinIndex::Medium(idx) => {
                 println!("- Index Type: Medium (RoaringBitmap)");
                 idx.print_stats_generic();
-            },
+            }
             DigitBinIndex::Large(idx) => {
                 println!("- Index Type: Large (RoaringTreemap)");
                 idx.print_stats_generic();
-            },
+            }
         }
     }
 
@@ -664,19 +1655,18 @@ impl DigitBinIndex {
             DigitBinIndex::Medium(idx) => idx.precision,
             DigitBinIndex::Large(idx) => idx.precision,
         }
-    }    
+    }
 }
 
 /// A data structure that organizes weighted items into bins based on their
 /// decimal digits to enable fast weighted random selection and updates.
 ///
-/// This structure is a specialized radix tree optimized for sequential sampling
-/// (like in Wallenius' distribution). It makes a deliberate engineering trade-off:
-/// it sacrifices a small, controllable amount of precision by binning items,
-/// but in return, it achieves O(P) performance for its core operations, where P
-/// is the configured precision. This is significantly faster than the O(log N)
-/// performance of general-purpose structures like a Fenwick Tree for its
-/// ideal use case.
+/// This structure is a specialized radix tree optimized for several weighted
+/// sampling designs. It makes a deliberate engineering trade-off: it sacrifices
+/// a small, controllable amount of precision by binning items, but in return,
+/// radix-tree traversal is O(P), where P is the configured precision. Backend
+/// leaf operations and Bernoulli, Fisher, or PPS batching have additional costs
+/// described by their respective methods.
 ///
 /// # Type Parameters
 ///
@@ -695,12 +1685,12 @@ impl DigitBinIndex {
 /// ```
 #[derive(Debug, Clone)]
 pub struct DigitBinIndexGeneric<B: DigitBin> {
-    /// The root node of the tree.
-    pub root: Node<B>,
-    /// The precision (number of decimal places) used for binning.
-    pub precision: u8,
-    /// The scaling factor (10^precision) as f64 for conversions.
+    root: Node<B>,
+    precision: u8,
     scale: f64,
+    rng: IndexRng,
+    order_generation: u64,
+    ids: RoaringTreemap,
 }
 
 impl<B: DigitBin> Default for DigitBinIndexGeneric<B> {
@@ -717,42 +1707,89 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
 
     #[must_use]
     pub fn with_precision(precision: u8) -> Self {
-        assert!(precision > 0, "Precision must be at least 1.");
-        assert!(precision <= MAX_PRECISION as u8, "Precision cannot be larger than {}.", MAX_PRECISION);
-        Self {
+        Self::try_with_precision(precision).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Constructs an index after validating that `precision` is in `1..=9`.
+    pub fn try_with_precision(precision: u8) -> Result<Self, DigitBinError> {
+        if precision == 0 || usize::from(precision) > MAX_PRECISION {
+            return Err(DigitBinError::InvalidPrecision(u64::from(precision)));
+        }
+        Ok(Self {
             root: Node::new_internal(),
             precision,
             scale: 10f64.powi(precision as i32),
-        }        
+            rng: IndexRng(WyRand::from_os_rng()),
+            order_generation: 0,
+            ids: RoaringTreemap::new(),
+        })
     }
 
-    /// Converts a f64 weight to an array of digits [0-9] for the given precision and the scaled u64 value.
-    /// Returns None if the weight is invalid (non-positive or zero after scaling).
-    fn weight_to_digits(&self, weight: f64, digits: &mut [u8; MAX_PRECISION]) -> Option<u64> {
-        if weight <= 0.0 || weight >= 1.0 {
-            return None;
+    /// Returns the number of decimal digits used to quantize weights.
+    pub fn precision(&self) -> u8 {
+        self.precision
+    }
+
+    /// Quantizes a finite weight in `(0, 1)` to the nearest representable bin.
+    /// Values within half a bin of either boundary are clamped to the smallest
+    /// or largest representable positive weight.
+    fn weight_to_digits(
+        &self,
+        weight: f64,
+        digits: &mut [u8; MAX_PRECISION],
+    ) -> Result<u64, DigitBinError> {
+        if !weight.is_finite() || weight <= 0.0 || weight >= 1.0 {
+            return Err(DigitBinError::InvalidWeight(weight));
         }
 
-        let scaled = (weight * self.scale) as u64;
-        if scaled == 0 {
-            return None;
-        }
+        let maximum = self.scale as u64 - 1;
+        let scaled = (weight * self.scale).round() as u64;
+        let scaled = scaled.clamp(1, maximum);
 
         let mut temp = scaled;
         for i in (0..self.precision as usize).rev() {
             digits[i] = (temp % 10) as u8;
             temp /= 10;
         }
-        Some(scaled)
+        Ok(scaled)
     }
 
     // --- Standard Functions ---
 
-    pub fn add(&mut self, individual_id: u64, weight: f64) {
-        let mut digits = [0u8; MAX_PRECISION];
-        if let Some(scaled) = self.weight_to_digits(weight, &mut digits) {
-            Self::add_recurse(&mut self.root, individual_id, scaled, &digits, 1, self.precision)
+    pub fn add(&mut self, individual_id: u64, weight: f64) -> Result<(), DigitBinError> {
+        if individual_id > B::MAX_ID {
+            return Err(DigitBinError::IdOutOfRange {
+                id: individual_id,
+                maximum: B::MAX_ID,
+            });
         }
+        let mut digits = [0u8; MAX_PRECISION];
+        let scaled = self.weight_to_digits(weight, &mut digits)?;
+        self.root
+            .content_count
+            .checked_add(1)
+            .ok_or(DigitBinError::CapacityOverflow)?;
+        self.root
+            .accumulated_value
+            .checked_add(scaled)
+            .ok_or(DigitBinError::CapacityOverflow)?;
+        if !self.ids.insert(individual_id) {
+            return Err(DigitBinError::DuplicateId(individual_id));
+        }
+
+        if !Self::add_recurse(
+            &mut self.root,
+            individual_id,
+            scaled,
+            &digits,
+            1,
+            self.precision,
+        ) {
+            self.ids.remove(individual_id);
+            return Err(DigitBinError::InvariantViolation);
+        }
+        self.order_generation = self.order_generation.wrapping_add(1);
+        Ok(())
     }
 
     /// Recursive private method to handle adding individuals.
@@ -763,60 +1800,145 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         digits: &[u8; MAX_PRECISION],
         current_depth: u8,
         max_depth: u8,
-    ) {
-        node.content_count += 1;
-        node.accumulated_value += scaled;
-
+    ) -> bool {
         if current_depth > max_depth {
             if let NodeContent::DigitIndex(_) = &node.content {
                 node.content = NodeContent::Bin(B::default());
             }
             if let NodeContent::Bin(bin) = &mut node.content {
-                bin.insert(individual_id);
+                if !bin.insert(individual_id) {
+                    return false;
+                }
             }
-            return;
+            node.content_count = node
+                .content_count
+                .checked_add(1)
+                .expect("root aggregate preflight guarantees descendant capacity");
+            node.accumulated_value = node
+                .accumulated_value
+                .checked_add(scaled)
+                .expect("root aggregate preflight guarantees descendant capacity");
+            return true;
         }
 
         let digit = digits[current_depth as usize - 1] as usize;
         if let NodeContent::DigitIndex(children) = &mut node.content {
-            // Get the child, creating it if it doesn't exist.
-            let child_node = children[digit].get_or_insert_with(Node::new_internal);
-            Self::add_recurse(child_node, individual_id, scaled, digits, current_depth + 1, max_depth);
+            let child_node = children.get_or_insert_with(digit, || {
+                if current_depth == max_depth {
+                    Node::new_bin()
+                } else {
+                    Node::new_internal()
+                }
+            });
+            if !Self::add_recurse(
+                child_node,
+                individual_id,
+                scaled,
+                digits,
+                current_depth + 1,
+                max_depth,
+            ) {
+                return false;
+            }
         }
+        node.content_count = node
+            .content_count
+            .checked_add(1)
+            .expect("root aggregate preflight guarantees descendant capacity");
+        node.accumulated_value = node
+            .accumulated_value
+            .checked_add(scaled)
+            .expect("root aggregate preflight guarantees descendant capacity");
+        true
     }
 
-    /// Adds multiple items to the index in a highly optimized batch operation.
-    ///
-    /// This method is significantly faster than calling `add` in a loop for large
-    /// collections of items. It works by first pre-processing the input items,
-    /// grouping them by their shared weight path (e.g., all items with weight 0.123...).
-    /// It then traverses the tree once per group, rather than once per item,
-    /// drastically reducing function call overhead and improving CPU cache performance
-    /// by performing aggregated updates at each node.
+    /// Validates a batch atomically, then performs one radix traversal per item.
+    /// Equal weight paths are not currently grouped for insertion.
     ///
     /// # Arguments
     ///
     /// * `items` - A slice of `(individual_id, weight)` tuples to add to the index.
     ///
-    pub fn add_many(&mut self, items: &[(u64, f64)]) {
+    pub fn add_many(&mut self, items: &[(u64, f64)]) -> Result<(), DigitBinError> {
         if items.is_empty() {
-            return;
+            return Ok(());
         }
 
-        let mut digits = [0u8; MAX_PRECISION];
+        let mut pending_ids = RoaringTreemap::new();
+        let mut prepared = Vec::with_capacity(items.len());
+        let mut total_scaled = 0u64;
         for &(id, weight) in items {
-            if let Some(scaled) = self.weight_to_digits(weight, &mut digits) {
-                Self::add_recurse(&mut self.root, id, scaled, &digits, 1, self.precision)
-            } 
+            if id > B::MAX_ID {
+                return Err(DigitBinError::IdOutOfRange {
+                    id,
+                    maximum: B::MAX_ID,
+                });
+            }
+            if !pending_ids.insert(id) {
+                return Err(DigitBinError::DuplicateId(id));
+            }
+            let mut digits = [0u8; MAX_PRECISION];
+            let scaled = self.weight_to_digits(weight, &mut digits)?;
+            total_scaled = total_scaled
+                .checked_add(scaled)
+                .ok_or(DigitBinError::CapacityOverflow)?;
+            prepared.push((id, scaled, digits));
         }
+        let added_count =
+            u64::try_from(prepared.len()).map_err(|_| DigitBinError::CapacityOverflow)?;
+        self.root
+            .content_count
+            .checked_add(added_count)
+            .ok_or(DigitBinError::CapacityOverflow)?;
+        self.root
+            .accumulated_value
+            .checked_add(total_scaled)
+            .ok_or(DigitBinError::CapacityOverflow)?;
+        if !self.ids.is_disjoint(&pending_ids) {
+            let duplicate = pending_ids
+                .iter()
+                .find(|&id| self.ids.contains(id))
+                .expect("non-disjoint ID sets have an intersection");
+            return Err(DigitBinError::DuplicateId(duplicate));
+        }
+
+        for (id, scaled, digits) in prepared {
+            if !Self::add_recurse(&mut self.root, id, scaled, &digits, 1, self.precision) {
+                return Err(DigitBinError::InvariantViolation);
+            }
+        }
+        self.ids |= pending_ids;
+        self.order_generation = self.order_generation.wrapping_add(1);
+        Ok(())
     }
 
-    pub fn remove(&mut self, individual_id: u64, weight: f64) -> bool{
-        let mut digits = [0u8; MAX_PRECISION];
-        if let Some(scaled) = self.weight_to_digits(weight, &mut digits) {
-            return Self::remove_recurse(&mut self.root, individual_id, scaled, &digits, 1, self.precision);
+    pub fn remove(&mut self, individual_id: u64, weight: f64) -> Result<bool, DigitBinError> {
+        if individual_id > B::MAX_ID {
+            return Err(DigitBinError::IdOutOfRange {
+                id: individual_id,
+                maximum: B::MAX_ID,
+            });
         }
-        false
+        let mut digits = [0u8; MAX_PRECISION];
+        let scaled = self.weight_to_digits(weight, &mut digits)?;
+        if !self.ids.contains(individual_id) {
+            return Ok(false);
+        }
+        let removed = Self::remove_recurse(
+            &mut self.root,
+            individual_id,
+            scaled,
+            &digits,
+            1,
+            self.precision,
+        )?;
+        if removed {
+            if !self.ids.remove(individual_id) {
+                return Err(DigitBinError::InvariantViolation);
+            }
+            self.order_generation = self.order_generation.wrapping_add(1);
+        }
+        Ok(removed)
     }
 
     /// Recursive private method to handle removing individuals.
@@ -827,355 +1949,969 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         digits: &[u8; MAX_PRECISION],
         current_depth: u8,
         max_depth: u8,
-    ) -> bool {
+    ) -> Result<bool, DigitBinError> {
         if current_depth > max_depth {
             if let NodeContent::Bin(bin) = &mut node.content {
-                let orig_len = bin.len();
-                bin.remove(individual_id);
-                if bin.len() < orig_len {
-                    node.content_count -= 1;
-                    node.accumulated_value -= scaled;
-                    return true;
+                if bin.remove(individual_id) {
+                    node.content_count = node
+                        .content_count
+                        .checked_sub(1)
+                        .ok_or(DigitBinError::InvariantViolation)?;
+                    node.accumulated_value = node
+                        .accumulated_value
+                        .checked_sub(scaled)
+                        .ok_or(DigitBinError::InvariantViolation)?;
+                    return Ok(true);
                 }
             }
-            return false;
+            return Ok(false);
         }
 
         let digit = digits[current_depth as usize - 1] as usize;
         if let NodeContent::DigitIndex(children) = &mut node.content {
-            // Check if the child at 'digit' exists and get a mutable reference to it.
-            if let Some(child_node) = children[digit].as_mut() {
-                // If it exists, recurse. If the recursion returns true (success)...
-                if Self::remove_recurse(child_node, individual_id, scaled, digits, current_depth + 1, max_depth) {
-                    // ...then update this node's stats and propagate the success upwards.
-                    node.content_count -= 1;
-                    node.accumulated_value -= scaled;
-                    return true;
+            let (removed, child_is_empty) = if let Some(child_node) = children.get_mut(digit) {
+                let removed = Self::remove_recurse(
+                    child_node,
+                    individual_id,
+                    scaled,
+                    digits,
+                    current_depth + 1,
+                    max_depth,
+                )?;
+                (removed, removed && child_node.content_count == 0)
+            } else {
+                (false, false)
+            };
+            if removed {
+                if child_is_empty {
+                    children.remove_digit(digit);
                 }
+                node.content_count = node
+                    .content_count
+                    .checked_sub(1)
+                    .ok_or(DigitBinError::InvariantViolation)?;
+                node.accumulated_value = node
+                    .accumulated_value
+                    .checked_sub(scaled)
+                    .ok_or(DigitBinError::InvariantViolation)?;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
-    /// Removes multiple items from the index in a highly optimized batch operation.
-    ///
-    /// This method is significantly faster than calling `remove` in a loop. It
-    /// groups the items to be removed by their weight path and traverses the tree
-    /// only once per group, performing aggregated updates on the way up.
+    /// Applies removals in input order after validating every ID and weight.
     ///
     /// The `(id, weight)` pairs must match items that are currently in the index.
-    /// If a given pair is not found, it is silently ignored.
+    /// Returns `Ok(true)` only if every pair is removed. A missing pair makes the
+    /// result `Ok(false)` but does not roll back earlier successful removals.
     ///
     /// # Arguments
     ///
     /// * `items` - A slice of `(id, weight)` tuples to remove from the index.
     ///
-    pub fn remove_many(&mut self, items: &[(u64, f64)]) -> bool {
+    pub fn remove_many(&mut self, items: &[(u64, f64)]) -> Result<bool, DigitBinError> {
         if items.is_empty() {
-            return false;
+            return Ok(false);
         }
 
-        let mut digits = [0u8; MAX_PRECISION];
+        for &(id, weight) in items {
+            if id > B::MAX_ID {
+                return Err(DigitBinError::IdOutOfRange {
+                    id,
+                    maximum: B::MAX_ID,
+                });
+            }
+            let mut digits = [0u8; MAX_PRECISION];
+            self.weight_to_digits(weight, &mut digits)?;
+        }
+
         let mut success = true;
         for &(id, weight) in items {
-            if let Some(scaled) = self.weight_to_digits(weight, &mut digits) {
-                success &= Self::remove_recurse(&mut self.root, id, scaled, &digits, 1, self.precision)
-            } else {
-                success &= false;                
-            }
+            success &= self.remove(id, weight)?;
         }
-        success
+        Ok(success)
     }
 
     // --- Selection Functions ---
 
     pub fn select(&mut self) -> Option<(u64, f64)> {
-        self.select_and_optionally_remove(false)
+        let Self {
+            root,
+            precision,
+            scale,
+            rng,
+            order_generation,
+            ..
+        } = self;
+        Self::select_with_rng_inner::<false, _>(
+            root,
+            *precision,
+            *scale,
+            *order_generation,
+            &mut rng.0,
+        )
+    }
+
+    pub fn select_with_rng(&mut self, rng: &mut impl Rng) -> Option<(u64, f64)> {
+        Self::select_with_rng_inner::<false, _>(
+            &mut self.root,
+            self.precision,
+            self.scale,
+            self.order_generation,
+            rng,
+        )
     }
 
     pub fn select_many(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
         self.select_many_and_optionally_remove(num_to_draw, false)
     }
 
+    /// Independently selects every item with its quantized weight as its
+    /// Bernoulli probability, without modifying the index.
+    pub fn select_bernoulli_many(&mut self) -> Option<Vec<(u64, f64)>> {
+        self.select_bernoulli_many_and_optionally_remove(false)
+    }
+
+    /// Performs independent Bernoulli selection using the caller-provided
+    /// random number generator.
+    pub fn select_bernoulli_many_with_rng(
+        &mut self,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        self.select_bernoulli_many_and_optionally_remove_with_rng(false, rng)
+    }
+
+    /// Selects a fixed-size probability-proportional-to-size sample without
+    /// mutating the index.
+    pub fn select_pps_many(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
+        self.select_pps_many_and_optionally_remove(num_to_draw, false)
+    }
+
+    /// Selects a PPS sample using the caller-provided random number generator.
+    pub fn select_pps_many_with_rng(
+        &mut self,
+        num_to_draw: u64,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        self.select_pps_many_and_optionally_remove_with_rng(num_to_draw, false, rng)
+    }
+
     pub fn select_and_remove(&mut self) -> Option<(u64, f64)> {
-        self.select_and_optionally_remove(true)
+        let Self {
+            root,
+            precision,
+            scale,
+            rng,
+            order_generation,
+            ids,
+        } = self;
+        let selected = Self::select_with_rng_inner::<true, _>(
+            root,
+            *precision,
+            *scale,
+            *order_generation,
+            &mut rng.0,
+        )?;
+        if !ids.remove(selected.0) {
+            return None;
+        }
+        Some(selected)
+    }
+
+    pub fn select_and_remove_with_rng(&mut self, rng: &mut impl Rng) -> Option<(u64, f64)> {
+        let selected = Self::select_with_rng_inner::<true, _>(
+            &mut self.root,
+            self.precision,
+            self.scale,
+            self.order_generation,
+            rng,
+        )?;
+        if !self.ids.remove(selected.0) {
+            return None;
+        }
+        Some(selected)
+    }
+
+    pub fn select_wallenius_many_and_remove(
+        &mut self,
+        num_to_draw: u64,
+    ) -> Option<Vec<(u64, f64)>> {
+        if num_to_draw > self.count() {
+            return None;
+        }
+        let Self {
+            root,
+            precision,
+            scale,
+            rng,
+            order_generation,
+            ids,
+        } = self;
+        let mut selected = Vec::with_capacity(num_to_draw as usize);
+        for _ in 0..num_to_draw {
+            let item = Self::select_with_rng_inner::<true, _>(
+                root,
+                *precision,
+                *scale,
+                *order_generation,
+                &mut rng.0,
+            )?;
+            if !ids.remove(item.0) {
+                return None;
+            }
+            selected.push(item);
+        }
+        Some(selected)
+    }
+
+    pub fn select_wallenius_many_and_remove_with_rng(
+        &mut self,
+        num_to_draw: u64,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        if num_to_draw > self.count() {
+            return None;
+        }
+        let precision = self.precision;
+        let scale = self.scale;
+        let order_generation = self.order_generation;
+        let mut selected = Vec::with_capacity(num_to_draw as usize);
+        for _ in 0..num_to_draw {
+            let item = Self::select_with_rng_inner::<true, _>(
+                &mut self.root,
+                precision,
+                scale,
+                order_generation,
+                rng,
+            )?;
+            if !self.ids.remove(item.0) {
+                return None;
+            }
+            selected.push(item);
+        }
+        Some(selected)
     }
 
     // Wrapper function to handle both select and select_and_remove
     pub fn select_and_optionally_remove(&mut self, with_removal: bool) -> Option<(u64, f64)> {
-        if self.root.content_count == 0 {
-            return None;
+        if with_removal {
+            self.select_and_remove()
+        } else {
+            self.select()
         }
-        let mut rng = WyRand::from_os_rng();
-        let random_target = rng.random_range(0u64..self.root.accumulated_value);
-        Self::select_and_optionally_remove_recurse(&mut self.root, random_target, 1, self.precision, &mut rng, with_removal, self.scale)
     }
 
-    // Helper function
-    fn select_and_optionally_remove_recurse(
+    fn select_with_rng_inner<const REMOVE: bool, R: Rng>(
+        root: &mut Node<B>,
+        precision: u8,
+        scale: f64,
+        order_generation: u64,
+        rng: &mut R,
+    ) -> Option<(u64, f64)> {
+        if root.content_count == 0 {
+            return None;
+        }
+        let random_target = rng.random_range(0..root.accumulated_value);
+        let (selected_id, scaled_weight) = Self::select_recurse::<REMOVE, R>(
+            root,
+            random_target,
+            1,
+            precision,
+            0,
+            order_generation,
+            rng,
+        )?;
+        Some((selected_id, scaled_weight as f64 / scale))
+    }
+
+    fn select_recurse<const REMOVE: bool, R: Rng>(
         node: &mut Node<B>,
         target: u64,
         current_depth: u8,
         max_depth: u8,
-        rng: &mut WyRand,
-        with_removal: bool,
-        scale: f64,
-    ) -> Option<(u64, f64)> {
-        // Base case: Bin node
+        scaled_prefix: u64,
+        order_generation: u64,
+        rng: &mut R,
+    ) -> Option<(u64, u64)> {
         if current_depth > max_depth {
             if let NodeContent::Bin(bin) = &mut node.content {
                 if bin.is_empty() {
                     return None;
                 }
-                let scaled_weight = node.accumulated_value / node.content_count as u64;
-                let weight = scaled_weight as f64 / scale;
-                let selected_id = if with_removal {
+                let selected_id = if REMOVE {
                     bin.get_random_and_remove(rng)?
                 } else {
                     bin.get_random(rng)?
                 };
-                if with_removal {
-                    node.content_count -= 1;
-                    node.accumulated_value -= scaled_weight;
+                if REMOVE {
+                    node.content_count = node.content_count.checked_sub(1)?;
+                    node.accumulated_value = node.accumulated_value.checked_sub(scaled_prefix)?;
                 }
-                return Some((selected_id, weight));
+                return Some((selected_id, scaled_prefix));
             }
             return None;
         }
 
-        // Recursive case: DigitIndex node
         if let NodeContent::DigitIndex(children) = &mut node.content {
-            let mut cum: u64 = 0;
-            // The iterator now gives us a mutable reference to the Option.
-            for child_option in children.iter_mut() {
-                // We pattern match to see if a child Node exists.
-                if let Some(child) = child_option.as_mut() {
-                    // Now, 'child' is a &mut Node<B>, and we can proceed with the original logic.
+            children.ensure_order(order_generation);
+            let mut cumulative = 0;
+            for position in 0..children.active_len as usize {
+                let digit = children.order[position] as usize;
+                if let Some(child) = children.children[digit].as_mut() {
                     if child.accumulated_value == 0 {
                         continue;
                     }
-                    if target < cum + child.accumulated_value {
-                        if let Some((selected_id, weight)) = Self::select_and_optionally_remove_recurse(
+                    if target < cumulative + child.accumulated_value {
+                        if let Some((selected_id, scaled_weight)) = Self::select_recurse::<REMOVE, R>(
                             child,
-                            target - cum,
+                            target - cumulative,
                             current_depth + 1,
                             max_depth,
+                            scaled_prefix * 10 + digit as u64,
+                            order_generation,
                             rng,
-                            with_removal,
-                            scale,
                         ) {
-                            if with_removal {
-                                node.content_count -= 1;
-                                node.accumulated_value -= (weight * scale).round() as u64;
+                            if REMOVE {
+                                node.content_count = node.content_count.checked_sub(1)?;
+                                node.accumulated_value =
+                                    node.accumulated_value.checked_sub(scaled_weight)?;
+                                children.child_decreased_at(position);
                             }
-                            return Some((selected_id, weight));
+                            return Some((selected_id, scaled_weight));
                         }
-                        // This path is taken if recursion fails, which implies an empty bin was selected.
-                        return None; 
+                        return None;
                     }
-                    cum += child.accumulated_value;
+                    cumulative += child.accumulated_value;
                 }
             }
         }
         None
-    } 
+    }
 
     pub fn select_many_and_remove(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
         self.select_many_and_optionally_remove(num_to_draw, true)
     }
 
-    // Wrapper function to handle both select_many and select_many_and_remove
-    pub fn select_many_and_optionally_remove(&mut self, num_to_draw: u64, with_removal: bool) -> Option<Vec<(u64, f64)>> {
+    /// Independently selects every item with its quantized weight as its
+    /// Bernoulli probability and removes the selected items.
+    pub fn select_bernoulli_many_and_remove(&mut self) -> Option<Vec<(u64, f64)>> {
+        self.select_bernoulli_many_and_optionally_remove(true)
+    }
+
+    /// Independently selects and removes items using the caller-provided random
+    /// number generator.
+    pub fn select_bernoulli_many_and_remove_with_rng(
+        &mut self,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        self.select_bernoulli_many_and_optionally_remove_with_rng(true, rng)
+    }
+
+    fn select_bernoulli_many_and_optionally_remove(
+        &mut self,
+        with_removal: bool,
+    ) -> Option<Vec<(u64, f64)>> {
+        let mut rng = WyRand::from_os_rng();
+        self.select_bernoulli_many_and_optionally_remove_with_rng(with_removal, &mut rng)
+    }
+
+    fn select_bernoulli_many_and_optionally_remove_with_rng(
+        &mut self,
+        with_removal: bool,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        if self.count() == 0 {
+            return Some(Vec::new());
+        }
+
+        let mut bins = Vec::new();
+        Self::collect_weight_bins(&self.root, &mut bins);
+        let counts = Self::sample_bernoulli_counts(&bins, self.scale, rng)?;
+        let num_selected = counts
+            .iter()
+            .try_fold(0u64, |total, &count| total.checked_add(count))?;
+        self.extract_binned_counts(&counts, num_selected, with_removal, rng)
+    }
+
+    /// Selects and removes a fixed-size probability-proportional-to-size sample.
+    pub fn select_pps_many_and_remove(&mut self, num_to_draw: u64) -> Option<Vec<(u64, f64)>> {
+        self.select_pps_many_and_optionally_remove(num_to_draw, true)
+    }
+
+    /// Selects and removes a PPS sample using the caller-provided random number
+    /// generator.
+    pub fn select_pps_many_and_remove_with_rng(
+        &mut self,
+        num_to_draw: u64,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        self.select_pps_many_and_optionally_remove_with_rng(num_to_draw, true, rng)
+    }
+
+    fn select_pps_many_and_optionally_remove(
+        &mut self,
+        num_to_draw: u64,
+        with_removal: bool,
+    ) -> Option<Vec<(u64, f64)>> {
+        let mut rng = WyRand::from_os_rng();
+        self.select_pps_many_and_optionally_remove_with_rng(num_to_draw, with_removal, &mut rng)
+    }
+
+    fn select_pps_many_and_optionally_remove_with_rng(
+        &mut self,
+        num_to_draw: u64,
+        with_removal: bool,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
         if num_to_draw > self.count() || num_to_draw == 0 {
-            return if num_to_draw == 0 { Some(Vec::new()) } else { None };
+            return if num_to_draw == 0 {
+                Some(Vec::new())
+            } else {
+                None
+            };
+        }
+
+        let mut bins = Vec::new();
+        Self::collect_weight_bins(&self.root, &mut bins);
+        let counts = Self::sample_pps_counts(&bins, num_to_draw, rng)?;
+        self.extract_binned_counts(&counts, num_to_draw, with_removal, rng)
+    }
+
+    // Wrapper function to handle both select_many and select_many_and_remove
+    pub fn select_many_and_optionally_remove(
+        &mut self,
+        num_to_draw: u64,
+        with_removal: bool,
+    ) -> Option<Vec<(u64, f64)>> {
+        if num_to_draw > self.count() || num_to_draw == 0 {
+            return if num_to_draw == 0 {
+                Some(Vec::new())
+            } else {
+                None
+            };
         }
         let mut rng = WyRand::from_os_rng();
+        self.select_many_with_rng(num_to_draw, with_removal, &mut rng)
+    }
+
+    fn select_many_with_rng(
+        &mut self,
+        num_to_draw: u64,
+        with_removal: bool,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        let max_scaled_weight = Self::max_scaled_weight(&self.root)?;
+        if Self::use_unique_fisher_path(num_to_draw, self.root.accumulated_value, max_scaled_weight)
+        {
+            return self.select_fisher_by_unique_rejection(num_to_draw, with_removal, rng);
+        }
+        let mut bins = Vec::new();
+        Self::collect_weight_bins(&self.root, &mut bins);
+        let counts = Self::sample_fisher_counts(&bins, num_to_draw, self.count(), rng);
+        self.extract_binned_counts(&counts, num_to_draw, with_removal, rng)
+    }
+
+    fn extract_binned_counts(
+        &mut self,
+        counts: &[u64],
+        num_to_draw: u64,
+        with_removal: bool,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
         let mut selected: Vec<(u64, f64)> = Vec::with_capacity(num_to_draw as usize);
-        let total_accum = self.root.accumulated_value;
-        // Create a Uniform distribution for the range [0, total_accum)
-        let uniform = Uniform::new(0u64, total_accum).expect("Valid range for Uniform");  
-        // Generate num_to_draw random numbers using sample_iter
-        let passed_targets: Vec<u64> = uniform
-            .sample_iter(&mut rng)
-            .take(num_to_draw as usize)
-            .collect();
-        Self::select_many_and_optionally_remove_recurse(
-            &mut self.root,
-            total_accum,
-            &mut selected,
-            &mut rng,
-            1,
-            self.precision,
+        let mut leaf_index = 0;
+        let extraction_settings = BatchExtractionSettings {
             with_removal,
-            passed_targets,
-            self.scale,
-        );
-        if selected.len() == num_to_draw as usize {
+            scale: self.scale,
+            order_generation: self.order_generation,
+        };
+        Self::extract_binned_sample(
+            &mut self.root,
+            counts,
+            &mut leaf_index,
+            &mut selected,
+            rng,
+            extraction_settings,
+        )?;
+        if selected.len() == num_to_draw as usize && leaf_index == counts.len() {
+            if with_removal {
+                for &(id, _) in &selected {
+                    if !self.ids.remove(id) {
+                        return None;
+                    }
+                }
+            }
             Some(selected)
         } else {
-            None // Should not happen if logic is correct
+            None
         }
     }
 
-    /// Recursive helper for batch selection and removal.
-    /// - node: Current subtree root.
-    /// - subtree_total: Accumulated value of this node (passed to avoid borrowing issues).
-    /// - selected: Mutable vec to collect (id, weight) from leaves.
-    /// - rng: Mutable RNG.
-    /// - current_depth: Current digit level.
-    /// - precision: The precision of the DigitBinIndex (passed explicitly).
-    /// - with_removal: Whether to remove selected items.
-    /// - passed_targets: Pre-computed relative targets from parent (in [0, subtree_total)).
-    /// - scale: The scaling factor for weight conversions.
-    fn select_many_and_optionally_remove_recurse(
-        node: &mut Node<B>,
-        subtree_total: u64,
-        selected: &mut Vec<(u64, f64)>,
-        rng: &mut WyRand,
-        current_depth: u8,
-        precision: u8,
+    fn use_unique_fisher_path(num_to_draw: u64, total_weight: u64, max_scaled_weight: u64) -> bool {
+        if num_to_draw < 2 {
+            return true;
+        }
+        let pair_count = num_to_draw as f64 * (num_to_draw - 1) as f64 * 0.5;
+        let max_item_probability = max_scaled_weight as f64 / total_weight as f64;
+        pair_count * max_item_probability <= 0.25
+    }
+
+    fn max_scaled_weight(node: &Node<B>) -> Option<u64> {
+        match &node.content {
+            NodeContent::DigitIndex(children) => children
+                .iter()
+                .rev()
+                .flatten()
+                .find(|child| child.content_count > 0)
+                .and_then(Self::max_scaled_weight),
+            NodeContent::Bin(bin) if !bin.is_empty() => {
+                Some(node.accumulated_value / node.content_count)
+            }
+            NodeContent::Bin(_) => None,
+        }
+    }
+
+    fn select_fisher_by_unique_rejection(
+        &mut self,
+        num_to_draw: u64,
         with_removal: bool,
-        passed_targets: Vec<u64>,
-        scale: f64,
-    ) {
-        let original_target_count = passed_targets.len() as u64;
-        if original_target_count == 0 {
-            return;
+        rng: &mut impl Rng,
+    ) -> Option<Vec<(u64, f64)>> {
+        let mut seen = HashSet::with_capacity(num_to_draw as usize);
+        let mut sample = Vec::with_capacity(num_to_draw as usize);
+
+        loop {
+            seen.clear();
+            sample.clear();
+            let mut duplicate = false;
+            for _ in 0..num_to_draw {
+                let target = rng.random_range(0..self.root.accumulated_value);
+                let (id, scaled_weight) = Self::select_scaled_recurse(
+                    &mut self.root,
+                    target,
+                    1,
+                    self.precision,
+                    0,
+                    self.order_generation,
+                    rng,
+                )?;
+                if !seen.insert(id) {
+                    duplicate = true;
+                    break;
+                }
+                sample.push((id, scaled_weight));
+            }
+            if !duplicate {
+                break;
+            }
         }
 
-        // This base case (leaf node) logic does not change, as it doesn't interact
-        // with the DigitIndex.
-        if current_depth > precision {
-            if let NodeContent::Bin(bin) = &mut node.content {
-                let bin_scaled = if node.content_count > 0 {
-                    node.accumulated_value / node.content_count as u64
-                } else {
-                    0u64
-                };
-                let bin_weight = bin_scaled as f64 / scale;
-                let to_select = original_target_count.min(node.content_count);
-                let mut picked = 0u64;
-                while picked < to_select && !bin.is_empty() {
-                    let id = if with_removal {
-                        bin.get_random_and_remove(rng).unwrap()
-                    } else {
-                        bin.get_random(rng).unwrap()
-                    };
-                    selected.push((id, bin_weight));
-                    picked += 1;
+        if with_removal {
+            self.order_generation = self.order_generation.wrapping_add(1);
+            let mut digits = [0; MAX_PRECISION];
+            for &(id, scaled_weight) in &sample {
+                Self::scaled_to_digits(scaled_weight, self.precision, &mut digits);
+                if !Self::remove_recurse(
+                    &mut self.root,
+                    id,
+                    scaled_weight,
+                    &digits,
+                    1,
+                    self.precision,
+                )
+                .ok()?
+                {
+                    return None;
                 }
-                if with_removal {
-                    node.content_count -= picked;
-                    node.accumulated_value -= bin_scaled * picked as u64;
+                if !self.ids.remove(id) {
+                    return None;
                 }
             }
-            return;
         }
 
-        // --- START OF MODIFIED LOGIC ---
+        Some(
+            sample
+                .into_iter()
+                .map(|(id, scaled_weight)| (id, scaled_weight as f64 / self.scale))
+                .collect(),
+        )
+    }
+
+    fn select_scaled_recurse(
+        node: &mut Node<B>,
+        target: u64,
+        current_depth: u8,
+        max_depth: u8,
+        scaled_prefix: u64,
+        order_generation: u64,
+        rng: &mut impl Rng,
+    ) -> Option<(u64, u64)> {
+        if current_depth > max_depth {
+            if let NodeContent::Bin(bin) = &node.content {
+                return bin.get_random(rng).map(|id| (id, scaled_prefix));
+            }
+            return None;
+        }
+
         if let NodeContent::DigitIndex(children) = &mut node.content {
-            // CHANGE: Use fixed-size arrays of length 10 instead of dynamically sized Vecs.
-            let mut child_assigned = [0u64; 10];
-            // Note: `Default::default()` works for arrays where the element type is `Default`.
-            let mut child_rel_targets: [Vec<u64>; 10] = Default::default();
-            let mut assigned = 0u64;
-
-            // --- Main assignment loop ---
-            for &target in &passed_targets {
-                let mut cum: u64 = 0;
-                let mut chosen_idx = None;
-                // CHANGE: Iterate over the array of Options.
-                for (i, child_option) in children.iter().enumerate() {
-                    // CHANGE: Only process existing children.
-                    if let Some(child) = child_option {
-                        if child.accumulated_value == 0 {
-                            continue;
-                        }
-                        if target < cum + child.accumulated_value {
-                            if child_assigned[i] + 1 <= child.content_count {
-                                chosen_idx = Some(i);
-                            }
-                            break;
-                        }
-                        cum += child.accumulated_value;
-                    }
+            children.ensure_order(order_generation);
+            let mut cumulative = 0;
+            for position in 0..children.active_len as usize {
+                let digit = children.order[position];
+                let child = children.children[digit as usize].as_mut()?;
+                if target < cumulative + child.accumulated_value {
+                    return Self::select_scaled_recurse(
+                        child,
+                        target - cumulative,
+                        current_depth + 1,
+                        max_depth,
+                        scaled_prefix * 10 + u64::from(digit),
+                        order_generation,
+                        rng,
+                    );
                 }
-                if let Some(idx) = chosen_idx {
-                    child_assigned[idx] += 1;
-                    // We need to re-calculate `cum` up to the chosen index to get the relative target.
-                    let start_of_child_range: u64 = children[..idx].iter().filter_map(|c| c.as_ref()).map(|c| c.accumulated_value).sum();
-                    let rel_target = target - start_of_child_range;
-                    child_rel_targets[idx].push(rel_target);
-                    assigned += 1;
-                }
-            }
-
-            // --- Rejection sampling for any remaining targets ---
-            let remaining = original_target_count - assigned;
-            let mut additional_assigned = 0u64;
-            while additional_assigned < remaining {
-                let target = rng.random_range(0u64..subtree_total);
-                let mut cum: u64 = 0;
-                let mut chosen_idx = None;
-                // CHANGE: Same iteration pattern as the loop above.
-                for (i, child_option) in children.iter().enumerate() {
-                    if let Some(child) = child_option {
-                        if child.accumulated_value == 0 {
-                            continue;
-                        }
-                        if target < cum + child.accumulated_value {
-                            if child_assigned[i] + 1 <= child.content_count {
-                                chosen_idx = Some(i);
-                            }
-                            break;
-                        }
-                        cum += child.accumulated_value;
-                    }
-                }
-                if let Some(idx) = chosen_idx {
-                    child_assigned[idx] += 1;
-                    let start_of_child_range: u64 = children[..idx].iter().filter_map(|c| c.as_ref()).map(|c| c.accumulated_value).sum();
-                    let rel_target = target - start_of_child_range;
-                    child_rel_targets[idx].push(rel_target);
-                    additional_assigned += 1;
-                }
-            }
-            
-            // CHANGE: Store accumulated values in a fixed-size array for the recursive calls.
-            let child_accums: [u64; 10] = std::array::from_fn(|i| {
-                children[i].as_ref().map_or(0, |c| c.accumulated_value)
-            });
-
-            // --- Recurse into children ---
-            // CHANGE: Iterate through mutable options.
-            for (i, child_option) in children.iter_mut().enumerate() {
-                let assign_count = child_assigned[i];
-                if assign_count > 0 {
-                    // We must have a child here if it was assigned targets.
-                    if let Some(child) = child_option {
-                        let rel_targets = std::mem::take(&mut child_rel_targets[i]);
-                        Self::select_many_and_optionally_remove_recurse(
-                            child,
-                            child_accums[i],
-                            selected,
-                            rng,
-                            current_depth + 1,
-                            precision,
-                            with_removal,
-                            rel_targets,
-                            scale,
-                        );
-                    }
-                }
-            }
-
-            if with_removal {
-                // --- Unwind: Update this node's stats ---
-                // CHANGE: Sum up counts and values from the existing children in the array.
-                node.content_count = children.iter().filter_map(|c| c.as_ref()).map(|c| c.content_count).sum();
-                node.accumulated_value = children.iter().filter_map(|c| c.as_ref()).map(|c| c.accumulated_value).sum();
+                cumulative += child.accumulated_value;
             }
         }
+        None
+    }
+
+    fn scaled_to_digits(scaled_weight: u64, precision: u8, digits: &mut [u8; MAX_PRECISION]) {
+        let mut remaining = scaled_weight;
+        for index in (0..precision as usize).rev() {
+            digits[index] = (remaining % 10) as u8;
+            remaining /= 10;
+        }
+    }
+
+    fn collect_weight_bins(node: &Node<B>, bins: &mut Vec<WeightBin>) {
+        match &node.content {
+            NodeContent::DigitIndex(children) => {
+                for child in children.iter().flatten() {
+                    Self::collect_weight_bins(child, bins);
+                }
+            }
+            NodeContent::Bin(bin) if !bin.is_empty() => bins.push(WeightBin {
+                count: node.content_count,
+                scaled_weight: node.accumulated_value / node.content_count,
+            }),
+            NodeContent::Bin(_) => {}
+        }
+    }
+
+    /// Draws the number of selected IDs in each equal-probability bin. Given a
+    /// bin count `K ~ Binomial(n, p)`, a uniform `K`-subset has probability
+    /// `p^K * (1-p)^(n-K)`, exactly matching independent Bernoulli trials for
+    /// the individual IDs.
+    fn sample_bernoulli_counts(
+        bins: &[WeightBin],
+        scale: f64,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<u64>> {
+        bins.iter()
+            .map(|bin| {
+                let probability = bin.scaled_weight as f64 / scale;
+                Binomial::new(bin.count, probability)
+                    .ok()
+                    .map(|distribution| distribution.sample(rng))
+            })
+            .collect()
+    }
+
+    /// Random-order systematic PPS over equal-weight bins. Each non-certainty
+    /// item has inclusion probability `remaining_draws * weight / remaining_mass`.
+    /// A uniform integer offset makes each bin's expected selected count exact
+    /// for the quantized integer weights, while the final count is always fixed.
+    fn sample_pps_counts(
+        bins: &[WeightBin],
+        num_to_draw: u64,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<u64>> {
+        if bins.is_empty() {
+            return None;
+        }
+
+        let bin_masses: Vec<u64> = bins
+            .iter()
+            .map(|bin| bin.count.checked_mul(bin.scaled_weight))
+            .collect::<Option<_>>()?;
+        let mut remaining_mass = bin_masses
+            .iter()
+            .try_fold(0u64, |total, &mass| total.checked_add(mass))?;
+        let mut remaining_draws = num_to_draw;
+        let mut selected_counts = vec![0u64; bins.len()];
+        let mut is_certain = vec![false; bins.len()];
+
+        // Water-fill inclusion probabilities. An item becomes certain whenever
+        // the proportional target lambda * weight reaches one; lambda is then
+        // recomputed over the remaining population.
+        let maximum_weight = bins.iter().map(|bin| bin.scaled_weight).max()?;
+        if u128::from(remaining_draws) * u128::from(maximum_weight) >= u128::from(remaining_mass) {
+            let mut descending_weight: Vec<usize> = (0..bins.len()).collect();
+            descending_weight.sort_unstable_by(|&left, &right| {
+                bins[right].scaled_weight.cmp(&bins[left].scaled_weight)
+            });
+            for index in descending_weight {
+                if u128::from(remaining_draws) * u128::from(bins[index].scaled_weight)
+                    < u128::from(remaining_mass)
+                {
+                    break;
+                }
+                selected_counts[index] = bins[index].count;
+                is_certain[index] = true;
+                remaining_draws = remaining_draws.checked_sub(bins[index].count)?;
+                remaining_mass = remaining_mass.checked_sub(bin_masses[index])?;
+                if remaining_draws == 0 {
+                    return Some(selected_counts);
+                }
+            }
+        }
+        if remaining_mass == 0 {
+            return None;
+        }
+
+        let mut randomized_bins: Vec<usize> = (0..bins.len())
+            .filter(|&index| !is_certain[index])
+            .collect();
+        randomized_bins.shuffle(rng);
+
+        let denominator = u128::from(remaining_mass);
+        let offset = u128::from(rng.random_range(0..remaining_mass));
+        let mut cumulative_numerator = 0u128;
+        let mut previous_boundary = 0u128;
+        for index in randomized_bins {
+            let numerator = u128::from(remaining_draws) * u128::from(bin_masses[index]);
+            cumulative_numerator = cumulative_numerator.checked_add(numerator)?;
+            let boundary = (cumulative_numerator + offset) / denominator;
+            let selected = u64::try_from(boundary.checked_sub(previous_boundary)?).ok()?;
+            if selected > bins[index].count {
+                return None;
+            }
+            selected_counts[index] = selected;
+            previous_boundary = boundary;
+        }
+        if previous_boundary != u128::from(remaining_draws) {
+            return None;
+        }
+        Some(selected_counts)
+    }
+
+    fn sample_fisher_counts(
+        bins: &[WeightBin],
+        num_to_draw: u64,
+        total_count: u64,
+        rng: &mut impl Rng,
+    ) -> Vec<u64> {
+        if bins.len() == 1 {
+            return vec![num_to_draw];
+        }
+
+        let use_complement = num_to_draw > total_count / 2;
+        let target = if use_complement {
+            total_count - num_to_draw
+        } else {
+            num_to_draw
+        };
+        if target == 0 {
+            return bins.iter().map(|bin| bin.count).collect();
+        }
+
+        let log_weights: Vec<f64> = bins
+            .iter()
+            .map(|bin| {
+                let log_weight = (bin.scaled_weight as f64).ln();
+                if use_complement {
+                    -log_weight
+                } else {
+                    log_weight
+                }
+            })
+            .collect();
+        let log_tilt = Self::find_fisher_log_tilt(bins, &log_weights, target);
+        let probabilities: Vec<f64> = log_weights
+            .iter()
+            .map(|&log_weight| Self::logistic(log_tilt + log_weight))
+            .collect();
+
+        if let Some(mut proposal) =
+            Self::sample_fisher_counts_by_partial_convolution(bins, &probabilities, target, rng)
+        {
+            if use_complement {
+                for (sample, bin) in proposal.iter_mut().zip(bins) {
+                    *sample = bin.count - *sample;
+                }
+            }
+            return proposal;
+        }
+
+        let distributions: Vec<Binomial> = bins
+            .iter()
+            .zip(&probabilities)
+            .map(|(bin, &probability)| {
+                Binomial::new(bin.count, probability).expect("valid Fisher binomial parameters")
+            })
+            .collect();
+
+        let mut proposal = vec![0; bins.len()];
+        loop {
+            let mut proposal_total = 0;
+            for (sample, distribution) in proposal.iter_mut().zip(&distributions) {
+                *sample = distribution.sample(rng);
+                proposal_total += *sample;
+            }
+            if proposal_total == target {
+                if use_complement {
+                    for (sample, bin) in proposal.iter_mut().zip(bins) {
+                        *sample = bin.count - *sample;
+                    }
+                }
+                return proposal;
+            }
+        }
+    }
+
+    fn sample_fisher_counts_by_partial_convolution(
+        bins: &[WeightBin],
+        probabilities: &[f64],
+        target: u64,
+        rng: &mut impl Rng,
+    ) -> Option<Vec<u64>> {
+        if bins.len() < FISHER_CONVOLUTION_MIN_BINS
+            || bins.len() != probabilities.len()
+            || bins
+                .iter()
+                .any(|bin| bin.count > FISHER_CONVOLUTION_MAX_BIN_COUNT)
+        {
+            return None;
+        }
+
+        let target = usize::try_from(target).ok()?;
+        let mut blocks = Vec::with_capacity(bins.len().div_ceil(FISHER_CONVOLUTION_BLOCK_SIZE));
+        for start in (0..bins.len()).step_by(FISHER_CONVOLUTION_BLOCK_SIZE) {
+            let end = (start + FISHER_CONVOLUTION_BLOCK_SIZE).min(bins.len());
+            blocks.push(FisherConvolutionBlock::build(
+                start,
+                &bins[start..end],
+                &probabilities[start..end],
+            )?);
+        }
+
+        let block_totals = FisherBlockConvolutionNode::sample_block_totals(
+            &blocks,
+            target,
+            FISHER_CONVOLUTION_TAIL_BLOCKS,
+            rng,
+        )?;
+
+        let mut counts = vec![0u64; bins.len()];
+        for (block, &block_total) in blocks.iter().zip(&block_totals) {
+            let start = block.root.start;
+            let end = block.root.end;
+            block.sample_conditioned(block_total, &mut counts, rng)?;
+            debug_assert_eq!(counts[start..end].iter().sum::<u64>(), block_total as u64,);
+        }
+        Some(counts)
+    }
+
+    fn find_fisher_log_tilt(bins: &[WeightBin], log_weights: &[f64], target: u64) -> f64 {
+        let target = target as f64;
+        let mut lower = -128.0;
+        let mut upper = 128.0;
+        let mut current = 0.0;
+
+        for _ in 0..32 {
+            let mut mean = 0.0;
+            let mut variance = 0.0;
+            for (bin, &log_weight) in bins.iter().zip(log_weights) {
+                let probability = Self::logistic(current + log_weight);
+                mean += bin.count as f64 * probability;
+                variance += bin.count as f64 * probability * (1.0 - probability);
+            }
+
+            if mean < target {
+                lower = current;
+            } else {
+                upper = current;
+            }
+            if (mean - target).abs() <= 1e-10 * target.max(1.0) {
+                break;
+            }
+
+            let candidate = current - (mean - target) / variance;
+            current = if candidate.is_finite() && candidate > lower && candidate < upper {
+                candidate
+            } else {
+                (lower + upper) * 0.5
+            };
+        }
+        current
+    }
+
+    fn logistic(value: f64) -> f64 {
+        if value >= 0.0 {
+            1.0 / (1.0 + (-value).exp())
+        } else {
+            let exp_value = value.exp();
+            exp_value / (1.0 + exp_value)
+        }
+    }
+
+    fn extract_binned_sample(
+        node: &mut Node<B>,
+        counts: &[u64],
+        leaf_index: &mut usize,
+        selected: &mut Vec<(u64, f64)>,
+        rng: &mut impl Rng,
+        settings: BatchExtractionSettings,
+    ) -> Option<()> {
+        match &mut node.content {
+            NodeContent::DigitIndex(children) => {
+                for digit in 0..10 {
+                    let child_is_empty = if let Some(child) = children.children[digit].as_mut() {
+                        Self::extract_binned_sample(
+                            child, counts, leaf_index, selected, rng, settings,
+                        )?;
+                        settings.with_removal && child.content_count == 0
+                    } else {
+                        false
+                    };
+                    if child_is_empty {
+                        children.remove_digit(digit);
+                    }
+                }
+            }
+            NodeContent::Bin(bin) if !bin.is_empty() => {
+                let count = *counts.get(*leaf_index)?;
+                *leaf_index += 1;
+                let scaled_weight = node.accumulated_value / node.content_count;
+                let weight = scaled_weight as f64 / settings.scale;
+                let ids =
+                    bin.get_random_many(rng, usize::try_from(count).ok()?, settings.with_removal)?;
+                selected.extend(ids.into_iter().map(|id| (id, weight)));
+                if settings.with_removal {
+                    node.content_count = node.content_count.checked_sub(count)?;
+                    node.accumulated_value = node
+                        .accumulated_value
+                        .checked_sub(scaled_weight.checked_mul(count)?)?;
+                }
+            }
+            NodeContent::Bin(_) => {}
+        }
+        if settings.with_removal {
+            if let NodeContent::DigitIndex(children) = &mut node.content {
+                node.content_count = children
+                    .iter()
+                    .flatten()
+                    .try_fold(0u64, |total, child| total.checked_add(child.content_count))?;
+                node.accumulated_value =
+                    children.iter().flatten().try_fold(0u64, |total, child| {
+                        total.checked_add(child.accumulated_value)
+                    })?;
+                children.rebuild_order(settings.order_generation);
+            }
+        }
+        Some(())
     }
 
     pub fn count(&self) -> u64 {
@@ -1200,7 +2936,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
             min_weight: Option<f64>,
             max_weight: Option<f64>,
             // We collect all bin sizes to calculate standard deviation later.
-            bin_sizes: Vec<usize>, 
+            bin_sizes: Vec<usize>,
             // Memory estimates
             mem_nodes: usize,
             mem_bins: usize,
@@ -1210,14 +2946,17 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
             node: &Node<B>,
             stats: &mut Stats,
             scale: f64,
+            include_node_storage: bool,
         ) {
             stats.node_count += 1;
-            stats.mem_nodes += std::mem::size_of::<Node<B>>();
+            if include_node_storage {
+                stats.mem_nodes += std::mem::size_of::<Node<B>>();
+            }
 
             if node.content_count > 0 {
                 stats.non_empty_node_count += 1;
             }
-            
+
             match &node.content {
                 NodeContent::DigitIndex(children) => {
                     // --- NEW: Calculate branching factor stats ---
@@ -1228,13 +2967,11 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
 
                     // Add memory for the heap-allocated array of 10 optional nodes.
                     stats.mem_nodes += std::mem::size_of::<[Option<Node<B>>; 10]>();
-                    
-                    // Iterate over the options in the array
-                    for child_option in children.iter() {
-                        // Only recurse into the children that actually exist (are Some)
-                        if let Some(child) = child_option {
-                            traverse(child, stats, scale);
-                        }
+
+                    for child in children.iter().flatten() {
+                        // Child nodes live inline in the boxed ten-slot array,
+                        // whose complete allocation was counted above.
+                        traverse(child, stats, scale, false);
                     }
                 }
                 NodeContent::Bin(bin) => {
@@ -1243,9 +2980,7 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
                     stats.bin_sizes.push(bin_size);
                     stats.total_bin_items += bin_size as u64;
 
-                    // Estimate memory for the bin's contents.
-                    // This is an approximation. For RoaringBitmap, `serialized_size()` would be more accurate.
-                    stats.mem_bins += bin_size * std::mem::size_of::<u32>();
+                    stats.mem_bins += bin.estimated_heap_bytes();
 
                     if bin_size == 0 {
                         stats.empty_bin_count += 1;
@@ -1253,8 +2988,10 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
                         // All items in a bin share the same weight.
                         let scaled_weight = node.accumulated_value / node.content_count;
                         let weight = scaled_weight as f64 / scale;
-                        stats.min_weight = Some(stats.min_weight.map_or(weight, |min| min.min(weight)));
-                        stats.max_weight = Some(stats.max_weight.map_or(weight, |max| max.max(weight)));
+                        stats.min_weight =
+                            Some(stats.min_weight.map_or(weight, |min| min.min(weight)));
+                        stats.max_weight =
+                            Some(stats.max_weight.map_or(weight, |max| max.max(weight)));
                     }
                 }
             }
@@ -1275,50 +3012,73 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
             mem_bins: 0,
         };
 
-        traverse(&self.root, &mut stats, self.scale);
-        
+        traverse(&self.root, &mut stats, self.scale, true);
+
         // --- Calculations ---
         let fill_ratio = if stats.node_count > 0 {
             stats.non_empty_node_count as f64 / stats.node_count as f64 * 100.0
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         // NEW: Calculate average branching factor
         let avg_branching_factor = if stats.internal_node_count > 0 {
             stats.child_slots_used as f64 / stats.internal_node_count as f64
-        } else { 0.0 };
-        
+        } else {
+            0.0
+        };
+
         let avg_bin_size = if stats.bin_count > 0 {
             stats.total_bin_items as f64 / stats.bin_count as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         let std_dev_bin_size = if stats.bin_count > 1 {
-            let variance = stats.bin_sizes.iter()
+            let variance = stats
+                .bin_sizes
+                .iter()
                 .map(|&size| (size as f64 - avg_bin_size).powi(2)) // Corrected: removed the `*`
-                .sum::<f64>() / (stats.bin_count - 1) as f64;
+                .sum::<f64>()
+                / (stats.bin_count - 1) as f64;
             variance.sqrt()
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         // NEW: Calculate bin size quartiles
         let (q1_bin_size, median_bin_size, q3_bin_size) = if !stats.bin_sizes.is_empty() {
             let mut sorted_sizes = stats.bin_sizes.clone();
             sorted_sizes.sort_unstable();
-            let q1 = sorted_sizes.get(sorted_sizes.len() / 4).cloned().unwrap_or(0);
-            let median = sorted_sizes.get(sorted_sizes.len() / 2).cloned().unwrap_or(0);
-            let q3 = sorted_sizes.get(sorted_sizes.len() * 3 / 4).cloned().unwrap_or(0);
+            let q1 = sorted_sizes
+                .get(sorted_sizes.len() / 4)
+                .cloned()
+                .unwrap_or(0);
+            let median = sorted_sizes
+                .get(sorted_sizes.len() / 2)
+                .cloned()
+                .unwrap_or(0);
+            let q3 = sorted_sizes
+                .get(sorted_sizes.len() * 3 / 4)
+                .cloned()
+                .unwrap_or(0);
             (q1, median, q3)
         } else {
             (0, 0, 0)
         };
-        
-        let total_mem_mb = (stats.mem_nodes + stats.mem_bins) as f64 / (1024.0 * 1024.0);
+
+        let ids_mem = self.ids.serialized_size();
+        let total_mem_mb = (stats.mem_nodes + stats.mem_bins + ids_mem) as f64 / (1024.0 * 1024.0);
         let nodes_mem_mb = stats.mem_nodes as f64 / (1024.0 * 1024.0);
         let bins_mem_mb = stats.mem_bins as f64 / (1024.0 * 1024.0);
-        
+        let ids_mem_mb = ids_mem as f64 / (1024.0 * 1024.0);
+
         // NEW: Calculate average weight
         let avg_weight = if self.count() > 0 {
             self.total_weight() / self.count() as f64
-        } else { 0.0 };
-        
+        } else {
+            0.0
+        };
 
         // --- Printing ---
         println!("\n[Tree Structure]");
@@ -1331,28 +3091,77 @@ impl<B: DigitBin> DigitBinIndexGeneric<B> {
         println!("\n[Memory (Estimated)]");
         println!("- Tree Structure:       {:.2} MB", nodes_mem_mb);
         println!("- Leaf Bins:            {:.2} MB", bins_mem_mb);
+        println!("- Global ID Set:        {:.2} MB", ids_mem_mb);
         println!("- Total Estimated:      {:.2} MB", total_mem_mb);
- 
+
         println!("\n[Items & Bins]");
         println!("- Total Items:          {}", stats.total_bin_items);
         println!("- Total Bins (Leaves):  {}", stats.bin_count);
         println!("- Empty Bins:           {}", stats.empty_bin_count);
         println!("- Avg Items per Bin:    {:.2}", avg_bin_size);
         println!("- Std Dev of Bin Size:  {:.2}", std_dev_bin_size);
-        println!("- Bin Size (min/max):   {} / {}", stats.bin_sizes.iter().min().map_or(0, |v| *v), stats.bin_sizes.iter().max().map_or(0, |v| *v));
-        println!("- Bin Size (Q1/Med/Q3): {} / {} / {}", q1_bin_size, median_bin_size, q3_bin_size); // NEW
-        
+        println!(
+            "- Bin Size (min/max):   {} / {}",
+            stats.bin_sizes.iter().min().map_or(0, |v| *v),
+            stats.bin_sizes.iter().max().map_or(0, |v| *v)
+        );
+        println!(
+            "- Bin Size (Q1/Med/Q3): {} / {} / {}",
+            q1_bin_size, median_bin_size, q3_bin_size
+        ); // NEW
+
         println!("\n[Weights]");
-        println!("- Smallest Weight:      {}", stats.min_weight.map_or("-".to_string(), |v| format!("{:.prec$}", v, prec = self.precision as usize)));
-        println!("- Largest Weight:       {}", stats.max_weight.map_or("-".to_string(), |v| format!("{:.prec$}", v, prec = self.precision as usize)));
-        println!("- Average Weight:       {:.prec$}", avg_weight, prec = self.precision as usize); // NEW
+        println!(
+            "- Smallest Weight:      {}",
+            stats.min_weight.map_or("-".to_string(), |v| format!(
+                "{:.prec$}",
+                v,
+                prec = self.precision as usize
+            ))
+        );
+        println!(
+            "- Largest Weight:       {}",
+            stats.max_weight.map_or("-".to_string(), |v| format!(
+                "{:.prec$}",
+                v,
+                prec = self.precision as usize
+            ))
+        );
+        println!(
+            "- Average Weight:       {:.prec$}",
+            avg_weight,
+            prec = self.precision as usize
+        ); // NEW
     }
 }
 
 #[cfg(feature = "python-bindings")]
 mod python {
     use super::*;
+    use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
+
+    fn python_precision(precision: i64) -> PyResult<u8> {
+        if !(1..=MAX_PRECISION as i64).contains(&precision) {
+            return Err(PyValueError::new_err(format!(
+                "precision must be between 1 and {MAX_PRECISION}, got {precision}"
+            )));
+        }
+        Ok(precision as u8)
+    }
+
+    fn python_error(error: DigitBinError) -> PyErr {
+        match error {
+            DigitBinError::InvalidPrecision(_) | DigitBinError::InvalidWeight(_) => {
+                PyValueError::new_err(error.to_string())
+            }
+            DigitBinError::IdOutOfRange { .. } | DigitBinError::CapacityOverflow => {
+                PyOverflowError::new_err(error.to_string())
+            }
+            DigitBinError::DuplicateId(_) => PyValueError::new_err(error.to_string()),
+            DigitBinError::InvariantViolation => PyRuntimeError::new_err(error.to_string()),
+        }
+    }
 
     #[pyclass(name = "DigitBinIndex")]
     struct PyDigitBinIndex {
@@ -1370,59 +3179,65 @@ mod python {
 
         /// Create a DigitBinIndex with a specific precision.
         #[staticmethod]
-        fn with_precision(precision: u64) -> Self {
-            PyDigitBinIndex {
-                index: DigitBinIndex::with_precision(precision.try_into().unwrap()),
-            }
+        fn with_precision(precision: i64) -> PyResult<Self> {
+            let precision = python_precision(precision)?;
+            Ok(PyDigitBinIndex {
+                index: DigitBinIndex::try_with_precision(precision).map_err(python_error)?,
+            })
         }
 
         /// Create a DigitBinIndex with a specific precision and expected capacity.
         #[staticmethod]
-        fn with_precision_and_capacity(precision: u8, capacity: u64) -> Self {
-            PyDigitBinIndex {
-                index: DigitBinIndex::with_precision_and_capacity(precision, capacity),
-            }
-        }        
+        fn with_precision_and_capacity(precision: i64, capacity: u64) -> PyResult<Self> {
+            let precision = python_precision(precision)?;
+            Ok(PyDigitBinIndex {
+                index: DigitBinIndex::try_with_precision_and_capacity(precision, capacity)
+                    .map_err(python_error)?,
+            })
+        }
 
         /// Create a DigitBinIndex with Vec<u32> bins and the specified precision.
         #[staticmethod]
-        fn small(precision: u8) -> Self {
-            PyDigitBinIndex {
-                index: DigitBinIndex::small(precision),
-            }
+        fn small(precision: i64) -> PyResult<Self> {
+            let precision = python_precision(precision)?;
+            Ok(PyDigitBinIndex {
+                index: DigitBinIndex::try_small(precision).map_err(python_error)?,
+            })
         }
 
         /// Create a DigitBinIndex with RoaringBitmap bins and the specified precision.
         #[staticmethod]
-        fn medium(precision: u8) -> Self {
-            PyDigitBinIndex {
-                index: DigitBinIndex::medium(precision),
-            }
+        fn medium(precision: i64) -> PyResult<Self> {
+            let precision = python_precision(precision)?;
+            Ok(PyDigitBinIndex {
+                index: DigitBinIndex::try_medium(precision).map_err(python_error)?,
+            })
         }
 
         /// Create a DigitBinIndex with RoaringTreemap bins and the specified precision.
         #[staticmethod]
-        fn large(precision: u8) -> Self {
-            PyDigitBinIndex {
-                index: DigitBinIndex::large(precision),
-            }
+        fn large(precision: i64) -> PyResult<Self> {
+            let precision = python_precision(precision)?;
+            Ok(PyDigitBinIndex {
+                index: DigitBinIndex::try_large(precision).map_err(python_error)?,
+            })
         }
 
-        fn add(&mut self, id: u64, weight: f64) {
-            self.index.add(id, weight)
+        fn add(&mut self, id: u64, weight: f64) -> PyResult<()> {
+            self.index.add(id, weight).map_err(python_error)
         }
 
-        fn add_many(&mut self, items: Vec<(u64, f64)>) {
-            self.index.add_many(&items);
+        fn add_many(&mut self, items: Vec<(u64, f64)>) -> PyResult<()> {
+            self.index.add_many(&items).map_err(python_error)
         }
 
-        fn remove(&mut self, id: u64, weight: f64) -> bool {
-            self.index.remove(id, weight)
+        fn remove(&mut self, id: u64, weight: f64) -> PyResult<bool> {
+            self.index.remove(id, weight).map_err(python_error)
         }
 
-        fn remove_many(&mut self, items: Vec<(u64, f64)>) -> bool {
-            self.index.remove_many(&items)
-        }        
+        fn remove_many(&mut self, items: Vec<(u64, f64)>) -> PyResult<bool> {
+            self.index.remove_many(&items).map_err(python_error)
+        }
 
         fn select(&mut self) -> Option<(u64, f64)> {
             self.index.select()
@@ -1432,8 +3247,28 @@ mod python {
             self.index.select_many(n)
         }
 
+        fn select_bernoulli_many(&mut self) -> Option<Vec<(u64, f64)>> {
+            self.index.select_bernoulli_many()
+        }
+
+        fn select_pps_many(&mut self, n: u64) -> Option<Vec<(u64, f64)>> {
+            self.index.select_pps_many(n)
+        }
+
         fn select_and_remove(&mut self) -> Option<(u64, f64)> {
             self.index.select_and_remove()
+        }
+
+        fn select_wallenius_many_and_remove(&mut self, n: u64) -> Option<Vec<(u64, f64)>> {
+            self.index.select_wallenius_many_and_remove(n)
+        }
+
+        fn select_bernoulli_many_and_remove(&mut self) -> Option<Vec<(u64, f64)>> {
+            self.index.select_bernoulli_many_and_remove()
+        }
+
+        fn select_pps_many_and_remove(&mut self, n: u64) -> Option<Vec<(u64, f64)>> {
+            self.index.select_pps_many_and_remove(n)
         }
 
         fn select_many_and_remove(&mut self, n: u64) -> Option<Vec<(u64, f64)>> {
@@ -1463,16 +3298,774 @@ mod python {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::StdRng;
+
+    fn assert_mass_ordered<B: DigitBin>(node: &mut Node<B>, order_generation: u64) {
+        if let NodeContent::DigitIndex(children) = &mut node.content {
+            children.ensure_order(order_generation);
+            let ordered = children.ordered_digits();
+            let active_digits: HashSet<_> = ordered.iter().copied().collect();
+            assert_eq!(active_digits.len(), ordered.len());
+
+            let expected_digits: HashSet<_> = children
+                .iter()
+                .enumerate()
+                .filter(|(_, child)| {
+                    child
+                        .as_ref()
+                        .is_some_and(|child| child.accumulated_value > 0)
+                })
+                .map(|(digit, _)| digit as u8)
+                .collect();
+            assert_eq!(active_digits, expected_digits);
+            let expected_mask = expected_digits
+                .iter()
+                .fold(0u16, |mask, &digit| mask | (1u16 << digit));
+            assert_eq!(children.active_mask, expected_mask);
+
+            for pair in ordered.windows(2) {
+                let left_digit = pair[0];
+                let right_digit = pair[1];
+                let left_mass = children.children[left_digit as usize]
+                    .as_ref()
+                    .unwrap()
+                    .accumulated_value;
+                let right_mass = children.children[right_digit as usize]
+                    .as_ref()
+                    .unwrap()
+                    .accumulated_value;
+                assert!(
+                    left_mass > right_mass || (left_mass == right_mass && left_digit > right_digit),
+                    "digits {left_digit} and {right_digit} are out of mass order"
+                );
+            }
+
+            for child in children.children.iter_mut().flatten() {
+                assert_mass_ordered(child, order_generation);
+            }
+        }
+    }
+
+    fn aggregate_tree<B: DigitBin>(node: &Node<B>) -> (u64, u64, usize) {
+        match &node.content {
+            NodeContent::DigitIndex(children) => {
+                let mut count = 0u64;
+                let mut mass = 0u64;
+                let mut nodes = 1usize;
+                for child in children.iter().flatten() {
+                    let (child_count, child_mass, child_nodes) = aggregate_tree(child);
+                    count = count.checked_add(child_count).unwrap();
+                    mass = mass.checked_add(child_mass).unwrap();
+                    nodes += child_nodes;
+                }
+                assert_eq!(node.content_count, count);
+                assert_eq!(node.accumulated_value, mass);
+                (count, mass, nodes)
+            }
+            NodeContent::Bin(bin) => {
+                assert_eq!(node.content_count, bin.len() as u64);
+                if node.content_count == 0 {
+                    assert_eq!(node.accumulated_value, 0);
+                } else {
+                    assert_eq!(node.accumulated_value % node.content_count, 0);
+                }
+                (node.content_count, node.accumulated_value, 1)
+            }
+        }
+    }
+
+    fn assert_index_invariants<B: DigitBin>(index: &DigitBinIndexGeneric<B>) {
+        let (count, mass, _) = aggregate_tree(&index.root);
+        assert_eq!(count, index.count());
+        assert_eq!(mass, index.root.accumulated_value);
+        assert_eq!(count, index.ids.len());
+    }
+
+    fn exercise_backend_contract<B: DigitBin>() {
+        let mut index = DigitBinIndexGeneric::<B>::with_precision(2);
+        index.add(7, 0.29).unwrap();
+        assert_eq!(index.add(7, 0.29), Err(DigitBinError::DuplicateId(7)));
+        assert_eq!(index.add(7, 0.71), Err(DigitBinError::DuplicateId(7)));
+        assert_eq!(index.count(), 1);
+        assert_eq!(index.total_weight(), 0.29);
+        assert!(!index.remove(7, 0.30).unwrap());
+        assert_index_invariants(&index);
+        assert!(index.remove(7, 0.29).unwrap());
+        assert_eq!(index.count(), 0);
+        assert_index_invariants(&index);
+    }
+
+    #[test]
+    fn test_duplicate_and_wrong_weight_contract_across_backends() {
+        exercise_backend_contract::<Vec<u32>>();
+        exercise_backend_contract::<RoaringBitmap>();
+        exercise_backend_contract::<RoaringTreemap>();
+    }
+
+    #[test]
+    fn test_id_boundaries_for_all_public_constructors() {
+        let mut u32_indexes = vec![
+            DigitBinIndex::new(),
+            DigitBinIndex::with_precision(2),
+            DigitBinIndex::small(2),
+            DigitBinIndex::medium(2),
+            DigitBinIndex::with_precision_and_capacity(2, 100),
+            DigitBinIndex::with_precision_and_capacity(1, 100_010),
+        ];
+        for index in &mut u32_indexes {
+            index.add(u32::MAX as u64, 0.5).unwrap();
+            assert_eq!(
+                index.add(u32::MAX as u64 + 1, 0.5),
+                Err(DigitBinError::IdOutOfRange {
+                    id: u32::MAX as u64 + 1,
+                    maximum: u32::MAX as u64,
+                })
+            );
+            assert_eq!(index.count(), 1);
+        }
+
+        let mut u64_indexes = vec![
+            DigitBinIndex::large(2),
+            DigitBinIndex::with_precision_and_capacity(1, 10_000_000_010),
+        ];
+        for index in &mut u64_indexes {
+            index.add(u32::MAX as u64, 0.5).unwrap();
+            index.add(u32::MAX as u64 + 1, 0.5).unwrap();
+            assert_eq!(index.count(), 2);
+        }
+    }
+
+    #[test]
+    fn test_validated_weight_contract_and_rounding() {
+        let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(2);
+        for weight in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY, -0.1, 0.0, 1.0] {
+            assert!(matches!(
+                index.add(1, weight),
+                Err(DigitBinError::InvalidWeight(_))
+            ));
+            assert_eq!(index.count(), 0);
+        }
+
+        index.add(1, f64::MIN_POSITIVE).unwrap();
+        index.add(2, 0.29).unwrap();
+        index.add(3, 0.999_999).unwrap();
+        assert_eq!(index.count(), 3);
+        assert!((index.total_weight() - 1.29).abs() < f64::EPSILON);
+        assert_index_invariants(&index);
+    }
+
+    #[test]
+    fn test_precision_and_aggregate_boundaries() {
+        assert_eq!(
+            DigitBinIndexGeneric::<Vec<u32>>::try_with_precision(0).unwrap_err(),
+            DigitBinError::InvalidPrecision(0)
+        );
+        assert_eq!(
+            DigitBinIndexGeneric::<Vec<u32>>::try_with_precision(10).unwrap_err(),
+            DigitBinError::InvalidPrecision(10)
+        );
+        assert_eq!(
+            DigitBinIndex::try_with_precision_and_capacity(0, u64::MAX).unwrap_err(),
+            DigitBinError::InvalidPrecision(0)
+        );
+
+        let mut count_overflow = DigitBinIndexGeneric::<Vec<u32>>::with_precision(1);
+        count_overflow.root.content_count = u64::MAX;
+        assert_eq!(
+            count_overflow.add(1, 0.1),
+            Err(DigitBinError::CapacityOverflow)
+        );
+
+        let mut mass_overflow = DigitBinIndexGeneric::<Vec<u32>>::with_precision(1);
+        mass_overflow.root.accumulated_value = u64::MAX;
+        assert_eq!(
+            mass_overflow.add(1, 0.1),
+            Err(DigitBinError::CapacityOverflow)
+        );
+    }
+
+    #[test]
+    fn test_add_many_is_atomic_on_validation_errors() {
+        let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(2);
+        assert_eq!(
+            index.add_many(&[(1, 0.1), (1, 0.2)]),
+            Err(DigitBinError::DuplicateId(1))
+        );
+        assert_eq!(index.count(), 0);
+        assert_index_invariants(&index);
+
+        assert!(matches!(
+            index.add_many(&[(1, 0.1), (2, f64::NAN)]),
+            Err(DigitBinError::InvalidWeight(_))
+        ));
+        assert_eq!(index.count(), 0);
+        assert_index_invariants(&index);
+    }
+
+    #[test]
+    fn test_removal_prunes_empty_weight_paths() {
+        let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(4);
+        let items: Vec<_> = (1..=2_000).map(|id| (id, id as f64 / 10_000.0)).collect();
+        index.add_many(&items).unwrap();
+        let (_, _, populated_nodes) = aggregate_tree(&index.root);
+        assert!(populated_nodes > 2_000);
+
+        assert!(index.remove_many(&items).unwrap());
+        let (_, _, remaining_nodes) = aggregate_tree(&index.root);
+        assert_eq!(remaining_nodes, 1);
+        assert_eq!(index.count(), 0);
+        assert_index_invariants(&index);
+    }
+
+    #[test]
+    fn test_zero_draws_preserve_aggregates() {
+        let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(2);
+        index.add_many(&[(1, 0.2), (2, 0.8)]).unwrap();
+        let before = (index.count(), index.root.accumulated_value);
+        assert_eq!(index.select_many(0), Some(Vec::new()));
+        assert_eq!(index.select_many_and_remove(0), Some(Vec::new()));
+        assert_eq!((index.count(), index.root.accumulated_value), before);
+        assert_index_invariants(&index);
+    }
+
+    #[test]
+    fn test_digit_scan_order_tracks_mass() {
+        let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(1);
+        for id in 0..100 {
+            index.add(id, 0.1).unwrap();
+        }
+        index.add(100, 0.9).unwrap();
+
+        let NodeContent::DigitIndex(children) = &mut index.root.content else {
+            panic!("root must be an internal node");
+        };
+        assert_ne!(children.order_generation, index.order_generation);
+        children.ensure_order(index.order_generation);
+        assert_eq!(children.order_generation, index.order_generation);
+        assert_eq!(children.ordered_digits(), &[1, 9]);
+        assert_mass_ordered(&mut index.root, index.order_generation);
+
+        for id in 0..99 {
+            assert!(index.remove(id, 0.1).unwrap());
+        }
+        let NodeContent::DigitIndex(children) = &mut index.root.content else {
+            panic!("root must be an internal node");
+        };
+        children.ensure_order(index.order_generation);
+        assert_eq!(children.ordered_digits(), &[9, 1]);
+        assert_mass_ordered(&mut index.root, index.order_generation);
+    }
+
+    #[test]
+    fn test_lazy_order_reactivates_an_empty_path() {
+        let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(1);
+        index.add(1, 0.1).unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        assert_eq!(index.select_and_remove_with_rng(&mut rng), Some((1, 0.1)));
+        assert_eq!(index.count(), 0);
+
+        index.add(2, 0.1).unwrap();
+        assert_eq!(index.select_with_rng(&mut rng), Some((2, 0.1)));
+        assert_mass_ordered(&mut index.root, index.order_generation);
+    }
+
+    #[test]
+    fn test_mass_ordered_scan_preserves_weight_intervals() {
+        let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(2);
+        for (id, weight) in [(1, 0.01), (2, 0.01), (3, 0.17), (4, 0.52), (5, 0.99)] {
+            index.add(id, weight).unwrap();
+        }
+        let mut observed = std::collections::BTreeMap::new();
+        let mut rng = StdRng::seed_from_u64(1);
+        for target in 0..index.root.accumulated_value {
+            let (_, scaled_weight) = DigitBinIndexGeneric::<Vec<u32>>::select_recurse::<false, _>(
+                &mut index.root,
+                target,
+                1,
+                index.precision,
+                0,
+                index.order_generation,
+                &mut rng,
+            )
+            .unwrap();
+            *observed.entry(scaled_weight).or_insert(0u64) += 1;
+        }
+
+        assert_eq!(observed.get(&1), Some(&2));
+        assert_eq!(observed.get(&17), Some(&17));
+        assert_eq!(observed.get(&52), Some(&52));
+        assert_eq!(observed.get(&99), Some(&99));
+        assert_mass_ordered(&mut index.root, index.order_generation);
+    }
+
+    #[test]
+    fn test_fisher_small_exact_distribution() {
+        const SIMULATIONS: usize = 13_000;
+        let mut frequencies = [0usize; 3];
+        let mut rng = StdRng::seed_from_u64(0xF15E_2026);
+
+        for _ in 0..SIMULATIONS {
+            let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(1);
+            index.add(0, 0.1).unwrap();
+            index.add(1, 0.1).unwrap();
+            index.add(2, 0.2).unwrap();
+            index.add(3, 0.2).unwrap();
+
+            let selected = index.select_many_with_rng(2, false, &mut rng).unwrap();
+            let high_weight_count = selected.iter().filter(|(_, weight)| *weight == 0.2).count();
+            frequencies[high_weight_count] += 1;
+        }
+
+        let expected = [1.0 / 13.0, 8.0 / 13.0, 4.0 / 13.0];
+        for (observed, expected) in frequencies.into_iter().zip(expected) {
+            let observed = observed as f64 / SIMULATIONS as f64;
+            assert!(
+                (observed - expected).abs() < 0.015,
+                "Observed Fisher probability {observed:.4} differs from {expected:.4}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bernoulli_inclusion_probabilities_and_independence() {
+        const SIMULATIONS: usize = 50_000;
+        let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(2);
+        let probabilities = [0.1, 0.2, 0.5, 0.5, 0.8];
+        for (id, &probability) in probabilities.iter().enumerate() {
+            index.add(id as u64, probability).unwrap();
+        }
+
+        let mut inclusions = [0usize; 5];
+        let mut joint_inclusions = 0usize;
+        let mut rng = StdRng::seed_from_u64(0xBE22_2026);
+        for _ in 0..SIMULATIONS {
+            let selected = index.select_bernoulli_many_with_rng(&mut rng).unwrap();
+            let mut seen = [false; 5];
+            for (id, returned_probability) in selected {
+                let id = id as usize;
+                assert!(!seen[id]);
+                assert_eq!(returned_probability, probabilities[id]);
+                seen[id] = true;
+                inclusions[id] += 1;
+            }
+            // IDs 2 and 3 share one probability bin. Their selections must
+            // still be independent at item level.
+            if seen[2] && seen[3] {
+                joint_inclusions += 1;
+            }
+        }
+
+        for (id, (&observed, &expected)) in inclusions.iter().zip(&probabilities).enumerate() {
+            let observed = observed as f64 / SIMULATIONS as f64;
+            assert!(
+                (observed - expected).abs() < 0.01,
+                "ID {id}: observed {observed:.4}, expected {expected:.4}"
+            );
+        }
+        let observed_joint = joint_inclusions as f64 / SIMULATIONS as f64;
+        let expected_joint = probabilities[2] * probabilities[3];
+        assert!(
+            (observed_joint - expected_joint).abs() < 0.006,
+            "joint inclusion: observed {observed_joint:.4}, expected {expected_joint:.4}"
+        );
+        assert_eq!(index.count(), 5);
+        assert_eq!(
+            DigitBinIndexGeneric::<Vec<u32>>::with_precision(2)
+                .select_bernoulli_many_with_rng(&mut rng),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn test_bernoulli_removal_across_backends() {
+        fn exercise<B: DigitBin>() {
+            let mut index = DigitBinIndexGeneric::<B>::with_precision(2);
+            let items: Vec<_> = (0..30)
+                .map(|id| (id, [0.1, 0.5, 0.9][id as usize % 3]))
+                .collect();
+            index.add_many(&items).unwrap();
+            let initial_count = index.count();
+            let initial_weight = index.total_weight();
+            let mut rng = StdRng::seed_from_u64(0xB32A_2026);
+            let selected = index
+                .select_bernoulli_many_and_remove_with_rng(&mut rng)
+                .unwrap();
+            let selected_ids: HashSet<_> = selected.iter().map(|(id, _)| *id).collect();
+            let removed_weight: f64 = selected.iter().map(|(_, weight)| weight).sum();
+
+            assert_eq!(selected_ids.len(), selected.len());
+            assert_eq!(index.count(), initial_count - selected.len() as u64);
+            assert!((index.total_weight() - (initial_weight - removed_weight)).abs() < 1e-12);
+            assert_index_invariants(&index);
+        }
+
+        exercise::<Vec<u32>>();
+        exercise::<RoaringBitmap>();
+        exercise::<RoaringTreemap>();
+    }
+
+    #[test]
+    fn test_pps_first_order_inclusion_probabilities() {
+        const SIMULATIONS: usize = 40_000;
+        let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(1);
+        for (id, weight) in [(0, 0.1), (1, 0.1), (2, 0.2), (3, 0.2), (4, 0.3), (5, 0.3)] {
+            index.add(id, weight).unwrap();
+        }
+
+        let expected = [0.25, 0.25, 0.5, 0.5, 0.75, 0.75];
+        let mut included = [0usize; 6];
+        let mut rng = StdRng::seed_from_u64(0x0055_2026);
+        for _ in 0..SIMULATIONS {
+            let selected = index.select_pps_many_with_rng(3, &mut rng).unwrap();
+            assert_eq!(selected.len(), 3);
+            let unique: HashSet<_> = selected.iter().map(|(id, _)| *id).collect();
+            assert_eq!(unique.len(), 3);
+            for (id, _) in selected {
+                included[id as usize] += 1;
+            }
+        }
+
+        for (id, (&observed, &expected)) in included.iter().zip(&expected).enumerate() {
+            let observed = observed as f64 / SIMULATIONS as f64;
+            assert!(
+                (observed - expected).abs() < 0.01,
+                "ID {id}: observed {observed:.4}, expected {expected:.4}"
+            );
+        }
+        assert_eq!(index.count(), 6);
+    }
+
+    #[test]
+    fn test_pps_certainty_items_and_removal_contract() {
+        const SIMULATIONS: usize = 10_000;
+        let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(2);
+        index.add(0, 0.9).unwrap();
+        for id in 1..=10 {
+            index.add(id, 0.01).unwrap();
+        }
+
+        let mut low_inclusions = [0usize; 10];
+        let mut rng = StdRng::seed_from_u64(0xCE27_2026);
+        for _ in 0..SIMULATIONS {
+            let selected = index.select_pps_many_with_rng(2, &mut rng).unwrap();
+            assert_eq!(selected.len(), 2);
+            assert!(selected.iter().any(|(id, _)| *id == 0));
+            for (id, _) in selected {
+                if id > 0 {
+                    low_inclusions[id as usize - 1] += 1;
+                }
+            }
+        }
+        for (id, observed) in low_inclusions.into_iter().enumerate() {
+            let observed = observed as f64 / SIMULATIONS as f64;
+            assert!(
+                (observed - 0.1).abs() < 0.015,
+                "low-weight ID {}: observed {observed:.4}, expected 0.1000",
+                id + 1
+            );
+        }
+
+        assert_eq!(
+            index.select_pps_many_with_rng(0, &mut rng),
+            Some(Vec::new())
+        );
+        assert!(index.select_pps_many_with_rng(12, &mut rng).is_none());
+        let selected = index
+            .select_pps_many_and_remove_with_rng(2, &mut rng)
+            .unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().any(|(id, _)| *id == 0));
+        assert_eq!(index.count(), 9);
+        assert_index_invariants(&index);
+    }
+
+    #[test]
+    fn test_pps_removal_across_backends() {
+        fn exercise<B: DigitBin>() {
+            let mut index = DigitBinIndexGeneric::<B>::with_precision(2);
+            index
+                .add_many(&[(1, 0.1), (2, 0.2), (3, 0.3), (4, 0.4)])
+                .unwrap();
+            let mut rng = StdRng::seed_from_u64(0xBACC_2026);
+            let selected = index
+                .select_pps_many_and_remove_with_rng(2, &mut rng)
+                .unwrap();
+            assert_eq!(selected.len(), 2);
+            assert_eq!(
+                selected
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                2
+            );
+            assert_eq!(index.count(), 2);
+            assert_index_invariants(&index);
+        }
+
+        exercise::<Vec<u32>>();
+        exercise::<RoaringBitmap>();
+        exercise::<RoaringTreemap>();
+    }
+
+    #[test]
+    fn test_fisher_convolution_tree_matches_direct_distribution() {
+        let bins = [
+            WeightBin {
+                count: 2,
+                scaled_weight: 1,
+            },
+            WeightBin {
+                count: 1,
+                scaled_weight: 2,
+            },
+            WeightBin {
+                count: 3,
+                scaled_weight: 3,
+            },
+        ];
+        let probabilities = [0.2, 0.5, 0.7];
+        let root = FisherConvolutionNode::build(0, &bins, &probabilities).unwrap();
+
+        fn choose(n: usize, k: usize) -> f64 {
+            (0..k.min(n - k)).fold(1.0, |value, index| {
+                value * (n - index) as f64 / (index + 1) as f64
+            })
+        }
+
+        let mut expected = vec![0.0; 7];
+        let mut conditioned_probability = 0.0;
+        let mut conditioned_first_count = 0.0;
+        for first in 0..=2 {
+            for second in 0..=1 {
+                for third in 0..=3 {
+                    let counts = [first, second, third];
+                    let capacities = [2, 1, 3];
+                    let probability = counts
+                        .into_iter()
+                        .zip(capacities)
+                        .zip(probabilities)
+                        .map(|((count, capacity), probability)| {
+                            choose(capacity, count)
+                                * probability.powi(count as i32)
+                                * (1.0 - probability).powi((capacity - count) as i32)
+                        })
+                        .product::<f64>();
+                    expected[first + second + third] += probability;
+                    if first + second + third == 3 {
+                        conditioned_probability += probability;
+                        conditioned_first_count += first as f64 * probability;
+                    }
+                }
+            }
+        }
+
+        for (observed, expected) in root.pmf.iter().zip(&expected) {
+            assert!((observed - expected).abs() < 1e-12);
+        }
+
+        let expected_first_count = conditioned_first_count / conditioned_probability;
+        let mut observed_first_count = 0u64;
+        let mut rng = StdRng::seed_from_u64(0xC011_D170);
+        for _ in 0..20_000 {
+            let mut counts = [0u64; 3];
+            root.sample_conditioned(3, &mut counts, &mut rng).unwrap();
+            assert_eq!(counts.iter().sum::<u64>(), 3);
+            observed_first_count += counts[0];
+        }
+        let observed_first_count = observed_first_count as f64 / 20_000.0;
+        assert!((observed_first_count - expected_first_count).abs() < 0.02);
+    }
+
+    #[test]
+    fn test_partial_fisher_convolution_returns_conditioned_counts() {
+        let bins = vec![
+            WeightBin {
+                count: 1,
+                scaled_weight: 1,
+            };
+            FISHER_CONVOLUTION_MIN_BINS
+        ];
+        let probabilities = vec![0.5; bins.len()];
+        let target = bins.len() as u64 / 2;
+        let mut rng = StdRng::seed_from_u64(0xC011_2026);
+        let counts = DigitBinIndexGeneric::<Vec<u32>>::sample_fisher_counts_by_partial_convolution(
+            &bins,
+            &probabilities,
+            target,
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(counts.len(), bins.len());
+        assert_eq!(counts.iter().sum::<u64>(), target);
+        assert!(counts.iter().all(|&count| count <= 1));
+    }
+
+    #[test]
+    fn test_fisher_tail_tree_matches_conditioned_block_distribution() {
+        const SIMULATIONS: usize = 40_000;
+        let probabilities = [0.1_f64, 0.3, 0.6, 0.8];
+        let bins = [WeightBin {
+            count: 1,
+            scaled_weight: 1,
+        }];
+        let blocks: Vec<_> = probabilities
+            .iter()
+            .enumerate()
+            .map(|(index, &probability)| {
+                FisherConvolutionBlock::build(index, &bins, &[probability]).unwrap()
+            })
+            .collect();
+
+        let mut expected = [0.0; 16];
+        let mut expected_total = 0.0;
+        for mask in 0u8..16 {
+            if mask.count_ones() != 2 {
+                continue;
+            }
+            let probability = probabilities
+                .iter()
+                .enumerate()
+                .map(|(index, &success_probability)| {
+                    if mask & (1 << index) != 0 {
+                        success_probability
+                    } else {
+                        1.0 - success_probability
+                    }
+                })
+                .product::<f64>();
+            expected_total += probability;
+            expected[mask as usize] = probability;
+        }
+        for probability in &mut expected {
+            *probability /= expected_total;
+        }
+
+        let mut observed = [0usize; 16];
+        let mut rng = StdRng::seed_from_u64(0x7A11_2026);
+        for _ in 0..SIMULATIONS {
+            let totals =
+                FisherBlockConvolutionNode::sample_block_totals(&blocks, 2, 2, &mut rng).unwrap();
+            assert_eq!(totals.iter().sum::<usize>(), 2);
+            let mask = totals
+                .iter()
+                .enumerate()
+                .fold(0usize, |mask, (index, &count)| mask | (count << index));
+            observed[mask] += 1;
+        }
+
+        for mask in 0usize..16 {
+            let observed = observed[mask] as f64 / SIMULATIONS as f64;
+            assert!(
+                (observed - expected[mask]).abs() < 0.006,
+                "mask {mask:04b}: observed {observed:.4}, expected {:.4}",
+                expected[mask]
+            );
+        }
+    }
+
+    #[test]
+    fn test_fisher_selection_is_unique_without_removal() {
+        let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(3);
+        for id in 0..100 {
+            index.add(id, 0.5).unwrap();
+        }
+        let mut rng = StdRng::seed_from_u64(42);
+        let small_selection = index.select_many_with_rng(2, false, &mut rng).unwrap();
+        let small_unique: HashSet<_> = small_selection.iter().map(|(id, _)| id).collect();
+        assert_eq!(small_unique.len(), 2);
+        assert_eq!(index.count(), 100);
+
+        let selected = index.select_many_with_rng(100, false, &mut rng).unwrap();
+        let unique: HashSet<_> = selected.iter().map(|(id, _)| id).collect();
+
+        assert_eq!(selected.len(), 100);
+        assert_eq!(unique.len(), 100);
+        assert_eq!(index.count(), 100);
+        assert_eq!(index.total_weight(), 50.0);
+    }
+
+    #[test]
+    fn test_fisher_complement_removal_preserves_aggregates() {
+        let mut index = DigitBinIndexGeneric::<Vec<u32>>::with_precision(1);
+        for id in 0..5 {
+            index.add(id, 0.1).unwrap();
+        }
+        for id in 5..10 {
+            index.add(id, 0.2).unwrap();
+        }
+        let mut rng = StdRng::seed_from_u64(7);
+        let selected = index.select_many_with_rng(9, true, &mut rng).unwrap();
+        let removed_weight: f64 = selected.iter().map(|(_, weight)| weight).sum();
+
+        assert_eq!(selected.len(), 9);
+        assert_eq!(index.count(), 1);
+        assert!((index.total_weight() - (1.5 - removed_weight)).abs() < f64::EPSILON);
+        assert_mass_ordered(&mut index.root, index.order_generation);
+    }
+
+    #[test]
+    fn test_wallenius_batch_matches_repeated_draws() {
+        let mut original = DigitBinIndexGeneric::<Vec<u32>>::with_precision(3);
+        for id in 0..100 {
+            original.add(id, (id % 9 + 1) as f64 / 10.0).unwrap();
+        }
+        let initial_weight = original.total_weight();
+        let mut batch_index = original.clone();
+        let mut repeated_index = original;
+        let mut batch_rng = StdRng::seed_from_u64(0xA11E_2026);
+        let mut repeated_rng = StdRng::seed_from_u64(0xA11E_2026);
+
+        let batch = batch_index
+            .select_wallenius_many_and_remove_with_rng(50, &mut batch_rng)
+            .unwrap();
+        let repeated: Vec<_> = (0..50)
+            .map(|_| {
+                repeated_index
+                    .select_and_remove_with_rng(&mut repeated_rng)
+                    .unwrap()
+            })
+            .collect();
+        let removed_weight: f64 = batch.iter().map(|(_, weight)| weight).sum();
+
+        assert_eq!(batch, repeated);
+        assert_eq!(batch_index.count(), 50);
+        assert_eq!(batch_index.count(), repeated_index.count());
+        assert_eq!(batch_index.total_weight(), repeated_index.total_weight());
+        assert!((batch_index.total_weight() - (initial_weight - removed_weight)).abs() < 1e-12);
+        assert_mass_ordered(&mut batch_index.root, batch_index.order_generation);
+        assert_mass_ordered(&mut repeated_index.root, repeated_index.order_generation);
+    }
+
+    #[test]
+    fn test_cloned_indexes_reproduce_persistent_rng_stream() {
+        let mut original = DigitBinIndexGeneric::<Vec<u32>>::with_precision(3);
+        for id in 0..20 {
+            original.add(id, (id + 1) as f64 / 21.0).unwrap();
+        }
+        let mut first = original.clone();
+        let mut second = original;
+
+        let first_sequence = first.select_wallenius_many_and_remove(10).unwrap();
+        let second_sequence = second.select_wallenius_many_and_remove(10).unwrap();
+
+        assert_eq!(first_sequence, second_sequence);
+    }
 
     #[test]
     fn test_select_and_remove() {
         let mut index = DigitBinIndex::with_precision(3);
-        index.add(1, 0.085);
-        index.add(2, 0.205);
-        index.add(3, 0.346);
-        index.add(4, 0.364);
+        index.add(1, 0.085).unwrap();
+        index.add(2, 0.205).unwrap();
+        index.add(3, 0.346).unwrap();
+        index.add(4, 0.364).unwrap();
         index.print_stats();
-        println!("Initial state: {} individuals, total weight = {}", index.count(), index.total_weight());    
+        println!(
+            "Initial state: {} individuals, total weight = {}",
+            index.count(),
+            index.total_weight()
+        );
         if let Some((id, weight)) = index.select_and_remove() {
             println!("Selected ID: {} with weight: {}", id, weight);
         }
@@ -1481,7 +4074,11 @@ mod tests {
             "The count is now {} and not 3 as expected",
             index.count()
         );
-        println!("Intermediate state: {} individuals, total weight = {}", index.count(), index.total_weight()); 
+        println!(
+            "Intermediate state: {} individuals, total weight = {}",
+            index.count(),
+            index.total_weight()
+        );
         if let Some(selection) = index.select_many_and_remove(2) {
             println!("Selection: {:?}", selection);
         }
@@ -1490,7 +4087,11 @@ mod tests {
             "The count is now {} and not 1 as expected",
             index.count()
         );
-        println!("Final state: {} individuals, total weight = {}", index.count(), index.total_weight()); 
+        println!(
+            "Final state: {} individuals, total weight = {}",
+            index.count(),
+            index.total_weight()
+        );
     }
 
     #[test]
@@ -1500,7 +4101,7 @@ mod tests {
         const TOTAL_ITEMS: u64 = ITEMS_PER_GROUP * 2;
         const NUM_DRAWS: u64 = TOTAL_ITEMS / 2;
 
-        let low_risk_weight = 0.1f64;  // 0.1
+        let low_risk_weight = 0.1f64; // 0.1
         let high_risk_weight = 0.2f64; // 0.2
 
         // --- Execution: Run many simulations to average out randomness ---
@@ -1509,8 +4110,12 @@ mod tests {
 
         for _ in 0..NUM_SIMULATIONS {
             let mut index = DigitBinIndex::with_precision_and_capacity(3, TOTAL_ITEMS);
-            for i in 0..ITEMS_PER_GROUP { index.add(i, low_risk_weight); }
-            for i in ITEMS_PER_GROUP..TOTAL_ITEMS { index.add(i, high_risk_weight); }
+            for i in 0..ITEMS_PER_GROUP {
+                index.add(i, low_risk_weight).unwrap();
+            }
+            for i in ITEMS_PER_GROUP..TOTAL_ITEMS {
+                index.add(i, high_risk_weight).unwrap();
+            }
 
             let mut high_risk_in_this_run = 0;
             for _ in 0..NUM_DRAWS {
@@ -1523,37 +4128,18 @@ mod tests {
             total_high_risk_selected += high_risk_in_this_run;
         }
 
-        // --- Validation: Check the statistical properties of a Wallenius' draw ---
+        // --- Validation: Compare with the exact sequential Wallenius mean ---
         let avg_high_risk = total_high_risk_selected as f64 / NUM_SIMULATIONS as f64;
-
-        // 1. The mean of a uniform draw (central hypergeometric) would be 500.
-        let uniform_mean = NUM_DRAWS as f64 * 0.5;
-
-        // 2. The mean of a simultaneous draw (Fisher's NCG) is based on initial proportions.
-        // This is the naive expectation we started with.
-        let fishers_mean = NUM_DRAWS as f64 * (2.0 / 3.0); // ~666.67
-
-        // The mean of a Wallenius' draw is mathematically proven to lie strictly
-        // between the uniform mean and the Fisher's mean.
+        let wallenius_mean = 618.050_138_498_636;
+        let tolerance = wallenius_mean * 0.02;
         assert!(
-            avg_high_risk > uniform_mean,
-            "Test failed: Result {:.2} was not biased towards higher weights (uniform mean is {:.2})",
-            avg_high_risk, uniform_mean
-        );
-
-        assert!(
-            avg_high_risk < fishers_mean,
-            "Test failed: Result {:.2} showed too much bias. It should be less than the Fisher's mean of {:.2} due to the Wallenius effect.",
-            avg_high_risk, fishers_mean
+            (avg_high_risk - wallenius_mean).abs() < tolerance,
+            "Wallenius test failed: Result {avg_high_risk:.2} was not close to {wallenius_mean:.2}"
         );
 
         println!(
-            "Distribution test passed: Got an average of {:.2} high-risk selections.",
-            avg_high_risk
-        );
-        println!(
-            "This correctly lies between the uniform mean ({:.2}) and the Fisher's mean ({:.2}), confirming the Wallenius' distribution behavior.",
-            uniform_mean, fishers_mean
+            "Wallenius test passed: Got avg {:.2} high-risk selections (expected ~{:.2}).",
+            avg_high_risk, wallenius_mean
         );
     }
     #[test]
@@ -1562,7 +4148,7 @@ mod tests {
         const TOTAL_ITEMS: u64 = ITEMS_PER_GROUP * 2;
         const NUM_DRAWS: u64 = TOTAL_ITEMS / 2;
 
-        let low_risk_weight = 0.1f64;  // 0.1
+        let low_risk_weight = 0.1f64; // 0.1
         let high_risk_weight = 0.2f64; // 0.2
 
         const NUM_SIMULATIONS: u32 = 100;
@@ -1570,27 +4156,34 @@ mod tests {
 
         for _ in 0..NUM_SIMULATIONS {
             let mut index = DigitBinIndex::with_precision_and_capacity(3, TOTAL_ITEMS);
-            for i in 0..ITEMS_PER_GROUP { index.add(i, low_risk_weight); }
-            for i in ITEMS_PER_GROUP..TOTAL_ITEMS { index.add(i, high_risk_weight); }
-            
+            for i in 0..ITEMS_PER_GROUP {
+                index.add(i, low_risk_weight).unwrap();
+            }
+            for i in ITEMS_PER_GROUP..TOTAL_ITEMS {
+                index.add(i, high_risk_weight).unwrap();
+            }
+
             // Call the new method
             if let Some(selected_ids) = index.select_many_and_remove(NUM_DRAWS) {
-                let high_risk_in_this_run = selected_ids.iter().filter(|&&(id, _)| id >= ITEMS_PER_GROUP).count();
+                let high_risk_in_this_run = selected_ids
+                    .iter()
+                    .filter(|&&(id, _)| id >= ITEMS_PER_GROUP)
+                    .count();
                 total_high_risk_selected += high_risk_in_this_run as u32;
             }
         }
-        
+
         let avg_high_risk = total_high_risk_selected as f64 / NUM_SIMULATIONS as f64;
-        let fishers_mean = NUM_DRAWS as f64 * (2.0 / 3.0);
+        let fishers_mean = 585.829_352_955_203;
         let tolerance = fishers_mean * 0.02;
 
-        // The mean of a Fisher's draw should be very close to the naive expectation.
         assert!(
             (avg_high_risk - fishers_mean).abs() < tolerance,
             "Fisher's test failed: Result {:.2} was not close to the expected mean of {:.2}",
-            avg_high_risk, fishers_mean
+            avg_high_risk,
+            fishers_mean
         );
-        
+
         println!(
             "Fisher's test passed: Got avg {:.2} high-risk selections (expected ~{:.2}).",
             avg_high_risk, fishers_mean
@@ -1606,27 +4199,27 @@ fn test_weight_to_digits() {
 
     // Test valid weight
     let mut digits = [0u8; MAX_PRECISION];
-    if let Some(scaled) = index.weight_to_digits(0.123, &mut digits) {    
+    if let Ok(scaled) = index.weight_to_digits(0.123, &mut digits) {
         assert_eq!(scaled, 123);
         assert_eq!(digits[0..3], [1, 2, 3]);
         assert_eq!(digits[3..], [0; 6]); // Remaining digits should be zero-padded
     } else {
-        panic!("Expected Some for valid weight");
+        panic!("expected a valid quantized weight");
     }
 
     // Test invalid weights
-    assert!(index.weight_to_digits(0.0, &mut digits).is_none());
-    assert!(index.weight_to_digits(-0.1, &mut digits).is_none());
-    assert!(index.weight_to_digits(0.0000001, &mut digits).is_none()); // Rounds to zero after scaling
+    assert!(index.weight_to_digits(0.0, &mut digits).is_err());
+    assert!(index.weight_to_digits(-0.1, &mut digits).is_err());
+    assert_eq!(index.weight_to_digits(0.0000001, &mut digits), Ok(1));
 
     // Test overflow (though unlikely for weights <1, but for completeness)
-    assert!(index.weight_to_digits(2.0, &mut digits).is_none()); // Should trigger temp != 0 check
+    assert!(index.weight_to_digits(2.0, &mut digits).is_err());
 }
 
 #[cfg(test)]
 #[test]
 fn test_add_many() {
-    const CAPACITY: u64 = 1_000_000u64;
+    const CAPACITY: u64 = 10_000;
     let mut index_one_at_a_time = DigitBinIndex::with_precision_and_capacity(3, CAPACITY);
     let mut index_all_at_once = DigitBinIndex::with_precision_and_capacity(3, CAPACITY);
     let mut population = Vec::with_capacity(CAPACITY as usize);
@@ -1634,16 +4227,25 @@ fn test_add_many() {
     for i in 0..CAPACITY {
         let weight: f64 = rng.random_range(0.001..=0.999);
         population.push((i, weight));
-        index_one_at_a_time.add(i, weight);
+        index_one_at_a_time.add(i, weight).unwrap();
     }
-    index_all_at_once.add_many(&population);
-    index_one_at_a_time.print_stats();
-    index_all_at_once.print_stats();
+    index_all_at_once.add_many(&population).unwrap();
+    assert_eq!(index_one_at_a_time.count(), CAPACITY);
+    assert_eq!(index_all_at_once.count(), CAPACITY);
+    assert_eq!(
+        index_one_at_a_time.total_weight(),
+        index_all_at_once.total_weight()
+    );
+
+    assert!(index_one_at_a_time.remove_many(&population).unwrap());
+    assert!(index_all_at_once.remove_many(&population).unwrap());
+    assert_eq!(index_one_at_a_time.count(), 0);
+    assert_eq!(index_all_at_once.count(), 0);
 }
 #[test]
 fn test_add() {
     let mut index = DigitBinIndex::new();
-    index.add(1, 0.5);
-    index.print_stats();
+    index.add(1, 0.5).unwrap();
+    assert_eq!(index.count(), 1);
+    assert_eq!(index.total_weight(), 0.5);
 }
-

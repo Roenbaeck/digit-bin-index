@@ -2,6 +2,12 @@
     "name": "Cargo",
     "image": "mcr.microsoft.com/devcontainers/base:jammy",
 
+    "features": {
+        "ghcr.io/devcontainers/features/sshd:1": {
+            "version": "latest"
+        }
+    },
+
     // Install Cargo when the devcontainer is made
     "onCreateCommand": "curl https://sh.rustup.rs -sSf | sh -s -- -y",
 

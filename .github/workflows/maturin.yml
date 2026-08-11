@@ -19,6 +19,36 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run Rust tests
+        run: cargo test --all-features
+
+  python-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build native wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+      - name: Install wheel and run Python behavior tests
+        run: |
+          python -m pip install dist/*.whl
+          python -m unittest tests/test_python.py
+
   linux:
     runs-on: ${{ matrix.platform.runner }}
     strategy:
@@ -45,7 +75,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --features python-bindings --out dist --find-interpreter
+          args: --release --features python-bindings,pyo3/extension-module --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: auto
       - name: Upload wheels
@@ -76,7 +106,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --features python-bindings --out dist --find-interpreter
+          args: --release --features python-bindings,pyo3/extension-module --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: musllinux_1_2
       - name: Upload wheels
@@ -104,7 +134,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --features python-bindings --out dist --find-interpreter
+          args: --release --features python-bindings,pyo3/extension-module --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -130,7 +160,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --features python-bindings --out dist --find-interpreter
+          args: --release --features python-bindings,pyo3/extension-module --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -142,11 +172,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
+      - name: Install source distribution and smoke test
+        run: |
+          python -m pip install dist/*.tar.gz
+          python -c "from digit_bin_index import DigitBinIndex; assert DigitBinIndex().count() == 0"
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:
